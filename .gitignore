@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__
+AU_shpfile/
+suburb_shpfile/
+rawdata/
+output/
+venv/
+.env
+crime_data_transform.log
