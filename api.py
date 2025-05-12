@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query, Path
+from fastapi import FastAPI, HTTPException, Query, Path, Depends
 from typing import List, Optional, Dict, Any
 from datetime import date
 from pydantic import BaseModel
@@ -31,7 +31,7 @@ class SuburbSummary(BaseModel):
     crime_rate_per_1000: float
     crime_trend: str
     total_crimes_12m: int
-    most_common_crime: str
+    #most_common_crime: str
     report_url: str
 
 class SuburbDetail(SuburbSummary):
@@ -63,18 +63,35 @@ class ReportResponse(BaseModel):
 class WidgetResponse(BaseModel):
     embed_code: str
 
-@app.get("/api/suburbs", response_model=List[SuburbSummary])
-async def get_suburbs(
+def get_query_params(
     region: Optional[str] = Query(None, description="Filter by region"),
-    min_safety_score: Optional[int] = Query(None, description="Minimum safety score (0-100)")
+    min_safety_score: Optional[int] = Query(None, description="Minimum safety score (0-100)"),
+    name: Optional[str] = Query(None, description="Filter by suburb name"),
+    council: Optional[str] = Query(None, description="Filter by council"),
+    crime_trend: Optional[str] = Query(None, description="Filter by crime trend"),
+    min_crime_rate: Optional[float] = Query(None, description="Minimum crime rate per 1000"),
+    max_crime_rate: Optional[float] = Query(None, description="Maximum crime rate per 1000"),
+    min_total_crimes: Optional[int] = Query(None, description="Minimum total crimes in last 12 months"),
+    max_total_crimes: Optional[int] = Query(None, description="Maximum total crimes in last 12 months"),
+    #most_common_crime: Optional[str] = Query(None, description="Filter by most common crime type")
 ):
+    return {k: v for k, v in locals().items() if v is not None}
+
+@app.get("/api/suburbs", response_model=List[SuburbSummary])
+async def get_suburbs(params: Dict[str, Any] = Depends(get_query_params)):
     """Get a list of suburbs with summary crime data"""
     query = supabase.table("suburbs").select("*")
     
-    if region:
-        query = query.eq("region", region)
-    if min_safety_score is not None:
-        query = query.gte("safety_score", min_safety_score)
+    # Apply all filters from query parameters
+    for field, value in params.items():
+        if field.startswith('min_'):
+            actual_field = field[4:]  # Remove 'min_' prefix
+            query = query.gte(actual_field, value)
+        elif field.startswith('max_'):
+            actual_field = field[4:]  # Remove 'max_' prefix
+            query = query.lte(actual_field, value)
+        else:
+            query = query.eq(field, value)
     
     response = query.execute()
     print(f"Query response: {response}")  # Debug print
@@ -102,21 +119,35 @@ async def get_suburb_detail(
     suburb["crimes"] = crimes_response.data
     return suburb
 
-@app.get("/api/crimes", response_model=List[CrimeEvent])
-async def get_crimes(
-    type: Optional[str] = Query(None, description="Filter by crime type"),
-    region: Optional[str] = Query(None, description="Filter by region"),
+def get_crime_query_params(
+    offence_category: Optional[str] = Query(None, description="Filter by crime type"),
+    district: Optional[str] = Query(None, description="Filter by district"),
+    area_unit: Optional[str] = Query(None, description="Filter by area unit"),
+    location_type: Optional[str] = Query(None, description="Filter by location type"),
+    offence_code: Optional[str] = Query(None, description="Filter by offence code"),
+    offence_description: Optional[str] = Query(None, description="Filter by offence description"),
+    suburb_id: Optional[str] = Query(None, description="Filter by suburb ID"),
+    start_date: Optional[str] = Query(None, description="Filter by start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Filter by end date (YYYY-MM-DD)"),
     month: Optional[str] = Query(None, description="Filter by month (YYYY-MM)")
 ):
+    return {k: v for k, v in locals().items() if v is not None}
+
+@app.get("/api/crimes", response_model=List[CrimeEvent])
+async def get_crimes(params: Dict[str, Any] = Depends(get_crime_query_params)):
     """Get crime events with optional filtering"""
     query = supabase.table("crimes").select("*")
     
-    if type:
-        query = query.eq("offence_category", type)
-    if region:
-        query = query.eq("district", region)
-    if month:
-        query = query.like("victimisation_date", f"{month}%")
+    # Apply all filters from query parameters
+    for field, value in params.items():
+        if field == 'month':
+            query = query.like("victimisation_date", f"{value}%")
+        elif field == 'start_date':
+            query = query.gte("victimisation_date", value)
+        elif field == 'end_date':
+            query = query.lte("victimisation_date", value)
+        else:
+            query = query.eq(field, value)
     
     response = query.execute()
     return response.data
