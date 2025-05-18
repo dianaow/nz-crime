@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 import geopandas as gpd
 from typing import Optional
+import pyproj
+print(pyproj.__version__)
 
 def convert_shapefile_to_geojson(
     input_path: str,
@@ -43,12 +45,36 @@ def convert_shapefile_to_geojson(
         # Read the shapefile
         print(f"Reading shapefile: {input_path}")
         gdf = gpd.read_file(input_path)
+        
+        # Print the current coordinate system
+        print(f"Input coordinate system: {gdf.crs}")
 
-        # Calculate centroids and add latitude/longitude columns
+        # Calculate centroids using a projected CRS first for accurate calculation
         print("Calculating centroids for each polygon...")
-        centroids = gdf.geometry.centroid
+        # Store original CRS to return to it after centroid calculation
+        original_crs = gdf.crs
+        
+        # Project to a suitable projected CRS (e.g., Web Mercator) for centroid calculation
+        gdf_projected = gdf.to_crs(epsg=3857)  # Web Mercator projection
+        centroids_projected = gdf_projected.geometry.centroid
+        
+        # Convert centroids back to original CRS
+        centroids = gpd.GeoSeries(centroids_projected, crs=3857).to_crs(original_crs)
+        
+        # Transform to WGS84 (EPSG:4326) if not already in that coordinate system
+        gdf = gdf.to_crs(epsg=4326)
+        centroids = centroids.to_crs(epsg=4326)
+        print(f"Transformed coordinate system: {gdf.crs}")
+
+        # Add latitude/longitude columns from the accurately calculated centroids
         gdf['longitude'] = centroids.x
         gdf['latitude'] = centroids.y
+
+        # Print a sample of the coordinates for verification
+        print("\nSample coordinates:")
+        sample = gdf.head(1)
+        print(f"Longitude: {sample['longitude'].values[0]}")
+        print(f"Latitude: {sample['latitude'].values[0]}")
 
         # Simplify geometry if requested
         if simplify:
