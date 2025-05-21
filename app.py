@@ -140,7 +140,7 @@ class CrimeDataTransformer:
         geo_file = os.path.join(os.path.dirname(self.input_file), 'geographic-areas-table-2023.csv')
         if os.path.exists(geo_file):
             # Only load the columns we need to save memory
-            self.geo_df = pd.read_csv(geo_file, usecols=['AU2017_code', 'AU2017_name', 'SA22023_code', 'SA22023_name_ascii', 'REGC2023_name', 'TA2023_name', 'MB2023_code', 'MB2013_code', 'UR2023_name'])
+            self.geo_df = pd.read_csv(geo_file, usecols=['AU2017_name', 'AU2017_name', 'SA22023_code', 'SA22023_name_ascii', 'REGC2023_name', 'TA2023_name', 'MB2023_code', 'MB2013_code', 'UR2023_name'])
             # Create a lookup dictionary for suburb matching
             self.geo_lookup = {}
             meshblock_lookup = {}
@@ -157,7 +157,7 @@ class CrimeDataTransformer:
                     # Add meshblock to the suburb's array if it exists
                     if not pd.isna(row['MB2023_code']):
                         meshblock_lookup[suburb_name].append(row['MB2023_code'])
-                
+
                 # Create a mapping from old meshblock codes to new ones
                 if not pd.isna(row['MB2013_code']) and not pd.isna(row['MB2023_code']):
                     self.meshblock_lookup[str(row['MB2013_code'])] = str(row['MB2023_code'])
@@ -167,7 +167,6 @@ class CrimeDataTransformer:
                 suburb_name = row['AU2017_name']
                 if suburb_name and not pd.isna(suburb_name):
                     self.geo_lookup[suburb_name] = {
-                        'AU2017_code': row['AU2017_code'],
                         'SA22023_code': row['SA22023_code'],
                         'SA22023_name': row['SA22023_name_ascii'],
                         'REGC2023_name': row['REGC2023_name'],
@@ -271,11 +270,23 @@ class CrimeDataTransformer:
         self.df_crime['Area Unit'] = self.df_crime['Area Unit'].apply(self._clean_text)
         self.df_crime['Territorial Authority'] = self.df_crime['Territorial Authority'].apply(self._clean_text)
 
+        # Convert suburb name and suburb_id columns to 2023 format
+        self.df_crime['SA22023_name'] = self.df_crime['Area Unit'].apply(lambda x: self.geo_lookup.get(x, {}).get('SA22023_name', ''))
+        self.df_crime['suburb_id'] = self.df_crime['Area Unit'].apply(lambda x: self.geo_lookup.get(x, {}).get('SA22023_code', ''))
+        
+        # Convert meshblock codes to 2023 format
+        self.df_crime['Meshblock'] = self.df_crime['Meshblock'].astype(str)
+        self.df_crime['MB2023_code'] = self.df_crime['Meshblock'].apply(lambda x: self.meshblock_lookup.get(x, x))
+        
     def _create_crimes_table(self) -> None:
         """Create the crimes table with individual crime records using parallel processing"""
         if self.df_crime is None or self.df_crime.empty:
             logger.warning("No crime data available to process")
             return
+
+        # Get valid meshblock codes from the meshblocks table
+        valid_meshblock_codes = set(self.df_meshblocks['id'].unique())
+        logger.info(f"Found {len(valid_meshblock_codes)} valid meshblock codes")
 
         # Define a function to process crime chunks in parallel
         def process_crime_chunk(chunk):
@@ -307,23 +318,10 @@ class CrimeDataTransformer:
             # Process each crime record in the chunk
             for _, row in chunk.iterrows():
                 # Skip records with empty suburb names
-                if pd.isna(row['Area Unit']) or row['Area Unit'] == '':
+                if pd.isna(row['SA22023_name']) or row['SA22023_name'] == '':
+                    #logger.warning(f"Skipping crime record due to invalid suburb name 2023: {row['Area Unit']}, {row['suburb_id']}")
                     continue
                     
-                # Generate UUID for crime_id
-                crime_id = str(uuid.uuid4())
-                
-                # Get suburb name from Area Unit
-                suburb_name = row['Area Unit']
-                
-                # Get suburb_id from geographic data lookup instead of mapping
-                geo_data = self.geo_lookup.get(suburb_name, {})
-                suburb_id = geo_data.get('AU2017_code')
-                
-                # Ensure suburb_id is never null (required by schema)
-                if not suburb_id:
-                    suburb_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, suburb_name))
-                
                 # Convert date to datetime
                 try:
                     date = pd.to_datetime(row['Year Month'], format='%B %Y')
@@ -344,20 +342,21 @@ class CrimeDataTransformer:
                     # Try to look up the code using the reverse lookup
                     offence_code = anzsoc_reverse_lookup.get(offence_division.lower(), "")
                 
-                # Get meshblock code and convert to 2023 code if available
-                original_meshblock = str(row.get('Meshblock', ''))
-                # Try to find the 2023 version of this meshblock code
-                meshblock_code_2023 = self.meshblock_lookup.get(original_meshblock, original_meshblock)
+                # Get meshblock code and validate it
+                meshblock_code = row['MB2023_code'] if not pd.isna(row['MB2023_code']) else None
+                if meshblock_code is not None and str(meshblock_code) not in valid_meshblock_codes:
+                    logger.warning(f"Skipping crime record due to invalid meshblock code: {meshblock_code}")
+                    continue
                 
                 # Create crime record
                 crime_record = {
-                    'event_id': crime_id,
-                    'suburb_id': suburb_id,
+                    'event_id': str(uuid.uuid4()), # Generate UUID for crime_id
+                    'suburb_id': row['suburb_id'],
                     'victimisation_date': formatted_date,
                     'offence_code': offence_code if offence_code else None,
                     'offence_category': row['ANZSOC Division'] if not pd.isna(row['ANZSOC Division']) else None,
                     'offence_description': row['ANZSOC Group'] if not pd.isna(row['ANZSOC Group']) else None,
-                    'meshblock_code': meshblock_code_2023 if meshblock_code_2023 else None
+                    'meshblock_code': str(meshblock_code) if meshblock_code is not None else None
                 }
                 
                 chunk_crimes.append(crime_record)
@@ -470,7 +469,7 @@ class CrimeDataTransformer:
         processed_suburbs = []
         
         for item in suburb_data_input:
-            suburb_name = item['suburb_name']
+            suburb_name = item['AU2017_name']
             suburb_df = item['suburb_df']
             
             try:
@@ -508,7 +507,7 @@ class CrimeDataTransformer:
                 
                 # Get geographic data from the lookup
                 geo_data = self.geo_lookup.get(suburb_name, {})
-                suburb_id = geo_data.get('AU2017_code') or str(uuid.uuid5(uuid.NAMESPACE_DNS, suburb_name))
+                suburb_id = geo_data.get('SA22023_code') or str(uuid.uuid5(uuid.NAMESPACE_DNS, suburb_name))
                 suburb_name_2023 = geo_data.get('SA22023_name', suburb_name)
                 default_region = suburb_df['Territorial Authority'].iloc[0] if not suburb_df['Territorial Authority'].empty else ''
                 region = geo_data.get('REGC2023_name') or default_region
@@ -579,8 +578,8 @@ class CrimeDataTransformer:
             logger.warning("No crime data available to process")
             return
             
-        # Group by Area Unit to prepare suburb data
-        suburb_groups = self.df_crime.groupby('Area Unit')
+        # Group by Suburb (2023) to prepare suburb data
+        suburb_groups = self.df_crime.groupby('SA22023_name')
         logger.info(f"Found {len(suburb_groups)} unique suburbs to process")
         
         # Prepare data for parallel processing
@@ -589,10 +588,12 @@ class CrimeDataTransformer:
         # Extract suburb data
         for suburb_name, suburb_df in suburb_groups:
             if pd.isna(suburb_name) or suburb_name == '':
+                logger.warning(f"Skipping suburb {suburb_name} due to empty name")
                 continue
                 
             # Create a dictionary with the suburb name and dataframe
             suburb_input = {
+                'AU2017_name': suburb_df['Area Unit'].iloc[0],
                 'suburb_name': suburb_name,
                 'suburb_df': suburb_df
             }
@@ -710,34 +711,43 @@ class CrimeDataTransformer:
             logger.warning("No crime data available for meshblock crime calculation")
             return
             
-        # Extract meshblock codes and convert to string to ensure consistent types
-        meshblock_codes = self.df_crime['Meshblock'].astype(str)
+        # Get valid suburb_ids from the suburbs table
+        valid_suburb_ids = set(self.df_suburbs['suburb_id'].unique())
+        logger.info(f"Found {len(valid_suburb_ids)} valid suburb IDs")
+            
+        # Group by meshblock and get the first suburb_id for each
+        meshblock_suburbs = self.df_crime.groupby('MB2023_code')['suburb_id'].first()
         
         # Count crime occurrences of each meshblock
-        crime_counts = meshblock_codes.value_counts().to_dict()
+        crime_counts = self.df_crime['MB2023_code'].value_counts().to_dict()
         
         # Create a list of meshblock record dictionaries
         meshblocks_list = []
+        
         for mb_code, count in crime_counts.items():
             # Skip empty/invalid codes
             if pd.isna(mb_code) or mb_code == '':
                 continue
+            
+            # Get the suburb ID from the crime data
+            suburb_id = meshblock_suburbs.get(mb_code)
+            
+            # Only create record if suburb_id is valid
+            if suburb_id is not None and suburb_id in valid_suburb_ids:
+                # Create a record for this meshblock
+                meshblock_record = {
+                    'id': mb_code,
+                    'suburb_id': suburb_id,
+                    'crime_count': count,
+                    'lat': 0,
+                    'lng': 0,
+                    'geometry': None
+                }
                 
-            # Convert old meshblock code to 2023 code
-            mb_code_2023 = self.meshblock_lookup.get(mb_code, mb_code)
-            
-            # Create a record for this meshblock
-            meshblock_record = {
-                'id': mb_code_2023,
-                'crime_count': count,
-                'MB2013_code': mb_code,
-                'lat': 0,
-                'lng': 0,
-                'geometry': None
-            }
-            
-            meshblocks_list.append(meshblock_record)
-
+                meshblocks_list.append(meshblock_record)
+            else:
+                logger.warning(f"Skipping meshblock {mb_code} due to invalid suburb_id: {suburb_id}")
+        
         logger.info(f"Created {len(meshblocks_list)} meshblock records from crime data")
 
         # Process meshblocks in parallel
@@ -950,6 +960,25 @@ class CrimeDataTransformer:
         
         logger.info("Completed saving all data to Supabase")
 
+    def save_to_csv(self) -> None:
+        """Save the transformed data to CSV files"""            
+        logger.info("Saving transformed data to CSV files...")
+        
+        # Save suburbs data
+        suburbs_file = os.path.join(self.output_dir, 'suburbs.csv')
+        self.df_suburbs.to_csv(suburbs_file, index=False)
+        logger.info(f"Saved suburbs data to {suburbs_file}")
+
+        # Save meshblocks data
+        meshblocks_file = os.path.join(self.output_dir, 'meshblocks.csv')
+        self.df_meshblocks.to_csv(meshblocks_file, index=False)
+        logger.info(f"Saved meshblocks data to {meshblocks_file}")
+
+        # Save crimes data
+        crimes_file = os.path.join(self.output_dir, 'crimes.csv')
+        self.df_crimes.to_csv(crimes_file, index=False)
+        logger.info(f"Saved crimes data to {crimes_file}")
+
     def _monitor_memory_usage(self) -> None:
         """Monitor and log memory usage"""
         process = psutil.Process()
@@ -986,16 +1015,28 @@ def process_large_dataset(input_file: str) -> None:
     transformer._load_data()
     transformer._transform_data()
     
+    # Create tables in sequence to ensure proper foreign key relationships
+    logger.info("Creating suburbs table...")
     transformer._create_suburbs_table()
     
+    logger.info("Creating meshblocks table...")
     transformer._create_meshblocks_table()
-
-    transformer._create_crimes_table()
+    
+    # Ensure meshblocks table is fully created before proceeding
+    if transformer.df_meshblocks is not None:
+        logger.info(f"Meshblocks table created with {len(transformer.df_meshblocks)} records")
+        logger.info("Creating crimes table...")
+        transformer._create_crimes_table()
+    else:
+        logger.error("Failed to create meshblocks table, skipping crimes table creation")
 
     # Save data to Supabase
     if transformer.supabase:
         transformer.save_to_supabase()
-    
+
+    # Save data to CSV
+    #transformer.save_to_csv()
+
     logger.info("Completed processing all data")
 
 def main():

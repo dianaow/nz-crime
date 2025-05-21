@@ -63,6 +63,14 @@ class ReportResponse(BaseModel):
 class WidgetResponse(BaseModel):
     embed_code: str
 
+class Meshblock(BaseModel):
+    id: str
+    suburb_id: Optional[str] = None
+    geometry: Optional[Dict[str, Any]] = None
+    crime_count: Optional[int] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
 def get_query_params(
     region: Optional[str] = Query(None, description="Filter by region"),
     min_safety_score: Optional[int] = Query(None, description="Minimum safety score (0-100)"),
@@ -99,21 +107,27 @@ async def get_suburbs(params: Dict[str, Any] = Depends(get_query_params)):
 
 @app.get("/api/suburbs/{suburb_id}", response_model=SuburbDetail)
 async def get_suburb_detail(
-    suburb_id: str = Path(..., description="The ID of the suburb")
+    suburb_id: str = Path(..., description="The ID of the suburb"),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(100, ge=1, le=1000, description="Number of records per page")
 ):
     """Get detailed information about a specific suburb"""
     # Get suburb data
     suburb_response = supabase.table("suburbs").select("*").eq("suburb_id", suburb_id).execute()
-    print(f"Suburb response: {suburb_response}")  # Debug print
     
     if not suburb_response.data:
         raise HTTPException(status_code=404, detail="Suburb not found")
     
     suburb = suburb_response.data[0]
     
-    # Get crimes for this suburb
-    crimes_response = supabase.table("crimes").select("*").eq("suburb_id", suburb_id).execute()
-    print(f"Crimes response: {crimes_response}")  # Debug print
+    # Get crimes for this suburb with pagination and selective columns
+    crimes_response = (
+        supabase.table("crimes")
+        .select("*")
+        .eq("suburb_id", suburb_id)
+        .range((page - 1) * page_size, page * page_size - 1)
+        .execute()
+    )
     
     # Combine the data
     suburb["crimes"] = crimes_response.data
@@ -181,4 +195,17 @@ async def get_suburb_widget(
     
     return {
         "embed_code": suburb_response.data[0]["widget_embed_code"]
-    } 
+    }
+
+@app.get("/api/meshblocks", response_model=List[Meshblock])
+async def get_meshblocks(
+    suburb_id: str = Query(..., description="Filter meshblocks by suburb ID")
+):
+    """Get meshblocks for a specific suburb"""
+    # Query meshblocks from Supabase
+    response = supabase.table("meshblocks").select("*").eq("suburb_id", suburb_id).execute()
+    
+    if not response.data:
+        raise HTTPException(status_code=404, detail="No meshblocks found for this suburb")
+    
+    return response.data 
