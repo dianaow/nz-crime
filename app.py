@@ -220,6 +220,9 @@ class CrimeDataTransformer:
                 mb_id = feature['properties']['MB2023_V1_']       
                 if mb_id:
                     try:
+                        # Strip leading zeros from meshblock ID
+                        mb_id = str(int(mb_id))  # Convert to int to remove leading zeros, then back to string
+                        
                         # Store the raw geometry instead of converting to WKT here
                         self.meshblock_geometries[str(mb_id)] = {
                             'geometry': feature['geometry'],  # Store raw GeoJSON geometry

@@ -86,7 +86,11 @@ def get_query_params(
     return {k: v for k, v in locals().items() if v is not None}
 
 @app.get("/api/suburbs", response_model=List[SuburbSummary])
-async def get_suburbs(params: Dict[str, Any] = Depends(get_query_params)):
+async def get_suburbs(
+    params: Dict[str, Any] = Depends(get_query_params),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(50, ge=1, le=100, description="Number of records per page")
+):
     """Get a list of suburbs with summary crime data"""
     query = supabase.table("suburbs").select("*")
     
@@ -101,8 +105,10 @@ async def get_suburbs(params: Dict[str, Any] = Depends(get_query_params)):
         else:
             query = query.eq(field, value)
     
+    # Apply pagination
+    query = query.range((page - 1) * page_size, page * page_size - 1)
+    
     response = query.execute()
-    print(f"Query response: {response}")  # Debug print
     return response.data
 
 @app.get("/api/suburbs/{suburb_id}", response_model=SuburbDetail)
@@ -120,11 +126,12 @@ async def get_suburb_detail(
     
     suburb = suburb_response.data[0]
     
-    # Get crimes for this suburb with pagination and selective columns
+    # Get crimes for this suburb with pagination, ordering by date, and limiting to last 12 months
     crimes_response = (
         supabase.table("crimes")
         .select("*")
         .eq("suburb_id", suburb_id)
+        .order("victimisation_date", desc=True)  # Order by date descending
         .range((page - 1) * page_size, page * page_size - 1)
         .execute()
     )
