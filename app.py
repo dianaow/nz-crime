@@ -82,6 +82,8 @@ class CrimeDataTransformer:
             try:
                 # Read the CSV file with tab delimiter
                 self.df_crime = pd.read_csv(self.input_file, encoding=encoding, sep='\t')
+                logger.info(f"Found {self.df_crime['Area Unit'].nunique()} unique Area Units in the dataset")
+                
                 logger.info(f"Successfully read file with {encoding} encoding")
                 break
             except UnicodeDecodeError:
@@ -175,7 +177,20 @@ class CrimeDataTransformer:
                         'meshblocks': meshblock_lookup.get(suburb_name, [])
                     }
             
-            logger.info(f"Loaded geographic areas data with {len(self.geo_df)} records")
+            # Analyze the mapping distribution in geo file
+            # Analyze the mapping distribution in geo file
+            geo_mapping_counts = self.geo_df.groupby('AU2017_name')['SA22023_name_ascii'].nunique()
+            logger.info("\nA=SA22023 to AU2017 mapping distribution in geo file:")
+            logger.info(f"Number of AU2017 areas with 1 SA2023: {len(geo_mapping_counts[geo_mapping_counts == 1])}")
+            logger.info(f"Number of AU2017 areas with 2-5 SA2023: {len(geo_mapping_counts[(geo_mapping_counts > 1) & (geo_mapping_counts <= 5)])}")
+            logger.info(f"Number of AU2017 areas with >5 SA2023: {len(geo_mapping_counts[geo_mapping_counts > 5])}")
+            
+            geo_mapping_counts1 = self.geo_df.groupby('SA22023_name_ascii')['AU2017_name'].nunique()
+            logger.info("\nAU2017 to SA22023 mapping distribution in geo file:")
+            logger.info(f"Number of SA22023 areas with 1 AU2017: {len(geo_mapping_counts1[geo_mapping_counts1 == 1])}")
+            logger.info(f"Number of SA22023 areas with 2-5 AU2017: {len(geo_mapping_counts1[(geo_mapping_counts1 > 1) & (geo_mapping_counts <= 5)])}")
+            logger.info(f"Number of SA22023 areas with >5 AU2017: {len(geo_mapping_counts1[geo_mapping_counts1 > 5])}")
+            
             logger.info(f"Created lookup for {len(self.geo_lookup)} suburbs with meshblock codes")
             logger.info(f"Created lookup for {len(self.meshblock_lookup)} meshblock codes")
         else:
@@ -262,37 +277,32 @@ class CrimeDataTransformer:
         
         return text.strip()
         
-    def _transform_data(self) -> None:
-        """Clean and transform the crime data before creating the suburbs and crimes tables"""
-        # Strip whitespace from column names and values
-        self.df_crime.columns = self.df_crime.columns.str.strip()
-        for col in self.df_crime.select_dtypes(include=['object']).columns:
-            self.df_crime[col] = self.df_crime[col].str.strip()
-            
-        # Clean special characters from Area Unit and Territorial Authority columns
-        self.df_crime['Area Unit'] = self.df_crime['Area Unit'].apply(self._clean_text)
-        self.df_crime['Territorial Authority'] = self.df_crime['Territorial Authority'].apply(self._clean_text)
-
-        # Convert suburb name and suburb_id columns to 2023 format
-        self.df_crime['SA22023_name'] = self.df_crime['Area Unit'].apply(lambda x: self.geo_lookup.get(x, {}).get('SA22023_name', ''))
-        self.df_crime['suburb_id'] = self.df_crime['Area Unit'].apply(lambda x: self.geo_lookup.get(x, {}).get('SA22023_code', ''))
-        
-        # Convert meshblock codes to 2023 format
-        self.df_crime['Meshblock'] = self.df_crime['Meshblock'].astype(str)
-        self.df_crime['MB2023_code'] = self.df_crime['Meshblock'].apply(lambda x: self.meshblock_lookup.get(x, x))
-        
     def _create_crimes_table(self) -> None:
         """Create the crimes table with individual crime records using parallel processing"""
         if self.df_crime is None or self.df_crime.empty:
             logger.warning("No crime data available to process")
             return
 
-        # Get valid meshblock codes from the meshblocks table
-        valid_meshblock_codes = set(self.df_meshblocks['id'].unique())
-        logger.info(f"Found {len(valid_meshblock_codes)} valid meshblock codes")
-
         # Define a function to process crime chunks in parallel
         def process_crime_chunk(chunk):
+            # Clean and transform the data using vectorized operations where possible
+            chunk.columns = chunk.columns.str.strip()
+            
+            # Clean text columns in bulk
+            text_columns = chunk.select_dtypes(include=['object']).columns
+            chunk[text_columns] = chunk[text_columns].apply(lambda x: x.str.strip())
+            
+            # Clean special characters from Area Unit and Territorial Authority columns
+            chunk['Area Unit'] = chunk['Area Unit'].apply(self._clean_text)
+            chunk['Territorial Authority'] = chunk['Territorial Authority'].apply(self._clean_text)
+
+            # Convert suburb name and suburb_id columns to 2023 format using vectorized operations
+            chunk['suburb_id'] = chunk['Area Unit'].map(lambda x: self.geo_lookup.get(x, {}).get('SA22023_code', ''))
+            
+            # Convert meshblock codes to 2023 format
+            chunk['Meshblock'] = chunk['Meshblock'].astype(str)
+            chunk['MB2023_code'] = chunk['Meshblock'].map(lambda x: self.meshblock_lookup.get(x, x))
+
             # Create ANZSOC division code mapping
             anzsoc_divisions = {
                 "1": "HOMICIDE AND RELATED OFFENCES",
@@ -316,59 +326,38 @@ class CrimeDataTransformer:
             # Create reverse lookup for extracting code from division name
             anzsoc_reverse_lookup = {v.lower(): k for k, v in anzsoc_divisions.items()}
             
-            chunk_crimes = []
+            # Process dates in bulk
+            chunk['victimisation_date'] = pd.to_datetime(chunk['Year Month'], format='%B %Y', errors='coerce').dt.strftime('%Y-%m-%d')
             
-            # Process each crime record in the chunk
+            # Extract offence codes in bulk
+            chunk['offence_code'] = chunk['ANZSOC Division'].apply(
+                lambda x: x[:2] if pd.notna(x) and len(str(x)) >= 2 and str(x)[:2].isdigit() 
+                else anzsoc_reverse_lookup.get(str(x).lower(), "") if pd.notna(x) else ""
+            )
+            
+            # Create crime records in bulk
+            crime_records = []
             for _, row in chunk.iterrows():
-                # Skip records with empty suburb names
-                if pd.isna(row['SA22023_name']) or row['SA22023_name'] == '':
-                    #logger.warning(f"Skipping crime record due to invalid suburb name 2023: {row['Area Unit']}, {row['suburb_id']}")
+                if pd.isna(row['suburb_id']) or row['suburb_id'] == '':
                     continue
                     
-                # Convert date to datetime
-                try:
-                    date = pd.to_datetime(row['Year Month'], format='%B %Y')
-                    formatted_date = date.strftime('%Y-%m-%d')
-                except (ValueError, TypeError):
-                    # Handle invalid date format
-                    logger.warning(f"Invalid date format for {row['Year Month']}, using NULL")
-                    formatted_date = None
-                
-                # Extract offence code from ANZSOC Division
-                offence_division = row['ANZSOC Division'] if not pd.isna(row['ANZSOC Division']) else ""
-                offence_code = ""
-                
-                # Try to extract code directly from the beginning of the string
-                if offence_division and len(offence_division) >= 2 and offence_division[:2].isdigit():
-                    offence_code = offence_division[:2]
-                else:
-                    # Try to look up the code using the reverse lookup
-                    offence_code = anzsoc_reverse_lookup.get(offence_division.lower(), "")
-                
-                # Get meshblock code and validate it
-                meshblock_code = row['MB2023_code'] if not pd.isna(row['MB2023_code']) else None
-                if meshblock_code is not None and str(meshblock_code) not in valid_meshblock_codes:
-                    logger.warning(f"Skipping crime record due to invalid meshblock code: {meshblock_code}")
-                    continue
-                
-                # Create crime record
                 crime_record = {
-                    'event_id': str(uuid.uuid4()), # Generate UUID for crime_id
+                    'event_id': str(uuid.uuid4()),
                     'suburb_id': row['suburb_id'],
-                    'victimisation_date': formatted_date,
-                    'offence_code': offence_code if offence_code else None,
-                    'offence_category': row['ANZSOC Division'] if not pd.isna(row['ANZSOC Division']) else None,
-                    'offence_description': row['ANZSOC Group'] if not pd.isna(row['ANZSOC Group']) else None,
-                    'meshblock_code': str(meshblock_code) if meshblock_code is not None else None
+                    'victimisation_date': row['victimisation_date'],
+                    'offence_code': row['offence_code'] if row['offence_code'] else None,
+                    'offence_category': row['ANZSOC Division'] if pd.notna(row['ANZSOC Division']) else None,
+                    'offence_description': row['ANZSOC Group'] if pd.notna(row['ANZSOC Group']) else None,
+                    'meshblock_code': str(row['MB2023_code']) if pd.notna(row['MB2023_code']) else None,
+                    'AU2017_name': row['Area Unit'] if pd.notna(row['Area Unit']) else None
                 }
-                
-                chunk_crimes.append(crime_record)
+                crime_records.append(crime_record)
             
-            return chunk_crimes
+            return crime_records
         
         # Create chunks of the crime data for parallel processing
         df_chunks = []
-        chunk_size = 10000
+        chunk_size = 50000  # Increased chunk size for better performance
         
         # If df_crime is already loaded as a whole, split it into chunks
         if isinstance(self.df_crime, pd.DataFrame):
@@ -476,8 +465,8 @@ class CrimeDataTransformer:
             suburb_df = item['suburb_df']
             
             try:
-                # Calculate crime statistics
-                suburb_df['Date'] = pd.to_datetime(suburb_df['Year Month'], format='%B %Y')
+                # Calculate crime statistics using victimisation_date
+                suburb_df['Date'] = pd.to_datetime(suburb_df['victimisation_date'])
                 current_date = datetime.now()
                 one_year_ago = current_date - timedelta(days=365)
                 last_12m_data = suburb_df[suburb_df['Date'] >= one_year_ago]
@@ -506,17 +495,16 @@ class CrimeDataTransformer:
                     crime_trend = "flat"
                     trend_3m_change = 0
                 
-                crime_breakdown = suburb_df.groupby('ANZSOC Group').size().to_dict()
+                crime_breakdown = suburb_df.groupby('offence_code').size().to_dict()
                 
                 # Get geographic data from the lookup
                 geo_data = self.geo_lookup.get(suburb_name, {})
                 suburb_id = geo_data.get('SA22023_code') or str(uuid.uuid5(uuid.NAMESPACE_DNS, suburb_name))
                 suburb_name_2023 = geo_data.get('SA22023_name', suburb_name)
-                default_region = suburb_df['Territorial Authority'].iloc[0] if not suburb_df['Territorial Authority'].empty else ''
-                region = geo_data.get('REGC2023_name') or default_region
+                region = geo_data.get('REGC2023_name')
                 council = geo_data.get('TA2023_name', '')
                 location_type = geo_data.get('UR2023_name', '')
-                meshblocks = geo_data.get('meshblocks', [])
+                #meshblocks = geo_data.get('meshblocks', [])
 
                 # Calculate crime rate based on suburb population
                 population = self._get_suburb_population(suburb_name_2023)
@@ -530,7 +518,7 @@ class CrimeDataTransformer:
                     'region': region,
                     'council': council,
                     'location_type': location_type,
-                    'meshblocks': meshblocks,  # Store as list
+                    #'meshblocks': meshblocks,  # Store as list
                     'lat': None,
                     'lng': None,
                     'geometry': None,
@@ -577,27 +565,30 @@ class CrimeDataTransformer:
 
     def _create_suburbs_table(self) -> None:
         """Create the suburbs table with aggregated crime data using parallel processing"""
-        if self.df_crime is None or self.df_crime.empty:
+        if self.df_crimes is None or self.df_crimes.empty:
             logger.warning("No crime data available to process")
             return
-            
-        # Group by Suburb (2023) to prepare suburb data
-        suburb_groups = self.df_crime.groupby('SA22023_name')
+        
+        # Group by suburb_id to prepare suburb data
+        suburb_groups = self.df_crimes.groupby('suburb_id')
         logger.info(f"Found {len(suburb_groups)} unique suburbs to process")
         
         # Prepare data for parallel processing
         suburb_inputs = []
         
         # Extract suburb data
-        for suburb_name, suburb_df in suburb_groups:
-            if pd.isna(suburb_name) or suburb_name == '':
-                logger.warning(f"Skipping suburb {suburb_name} due to empty name")
+        for suburb_id, suburb_df in suburb_groups:
+            if pd.isna(suburb_id) or suburb_id == '':
+                logger.warning(f"Skipping suburb {suburb_id} due to empty ID")
                 continue
                 
-            # Create a dictionary with the suburb name and dataframe
+            # Get the original Area Unit name from the first record in df_crimes
+            area_unit = suburb_df['AU2017_name'].iloc[0] if not suburb_df.empty else ''
+                
+            # Create a dictionary with the suburb data
             suburb_input = {
-                'AU2017_name': suburb_df['Area Unit'].iloc[0],
-                'suburb_name': suburb_name,
+                'AU2017_name': area_unit,
+                'suburb_id': suburb_id,
                 'suburb_df': suburb_df
             }
             suburb_inputs.append(suburb_input)
@@ -606,7 +597,7 @@ class CrimeDataTransformer:
         processed_suburbs = []
         
         # Split into batches for parallel processing
-        batch_size = 500  # Process in batches of 250 suburbs
+        batch_size = 500  # Process in batches of 500 suburbs
         suburb_batches = [suburb_inputs[i:i + batch_size] for i in range(0, len(suburb_inputs), batch_size)]
         
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -644,9 +635,9 @@ class CrimeDataTransformer:
                 'rank_in_region': 0
             })
             
-            self.df_suburbs['meshblocks'] = self.df_suburbs['meshblocks'].apply(
-                lambda x: x if isinstance(x, list) else []
-            )
+            # self.df_suburbs['meshblocks'] = self.df_suburbs['meshblocks'].apply(
+            #     lambda x: x if isinstance(x, list) else []
+            # )
             
             if 'tags' in self.df_suburbs.columns:
                 self.df_suburbs['tags'] = self.df_suburbs['tags'].apply(
@@ -710,19 +701,19 @@ class CrimeDataTransformer:
         """
         Process meshblocks with crime counts and geometries using parallel processing
         """
-        if self.df_crime is None or self.df_crime.empty:
+        if self.df_crimes is None or self.df_crimes.empty:
             logger.warning("No crime data available for meshblock crime calculation")
             return
             
-        # Get valid suburb_ids from the suburbs table
-        valid_suburb_ids = set(self.df_suburbs['suburb_id'].unique())
-        logger.info(f"Found {len(valid_suburb_ids)} valid suburb IDs")
+        # Get valid suburb_ids from the crimes data instead of suburbs table
+        valid_suburb_ids = set(self.df_crimes['suburb_id'].unique())
+        logger.info(f"Found {len(valid_suburb_ids)} valid suburb IDs from crimes data")
             
         # Group by meshblock and get the first suburb_id for each
-        meshblock_suburbs = self.df_crime.groupby('MB2023_code')['suburb_id'].first()
+        meshblock_suburbs = self.df_crimes.groupby('meshblock_code')['suburb_id'].first()
         
         # Count crime occurrences of each meshblock
-        crime_counts = self.df_crime['MB2023_code'].value_counts().to_dict()
+        crime_counts = self.df_crimes['meshblock_code'].value_counts().to_dict()
         
         # Create a list of meshblock record dictionaries
         meshblocks_list = []
@@ -927,6 +918,7 @@ class CrimeDataTransformer:
         """
         Efficiently save crimes data to Supabase table using batch processing.
         """
+        self.df_crimes = self.df_crimes.drop('AU2017_name', axis=1)
         self._save_dataframe_to_supabase(
             df=self.df_crimes,
             table_name='crimes',
@@ -1014,30 +1006,23 @@ def process_large_dataset(input_file: str) -> None:
     transformer._load_suburbs_geojson()
     transformer._load_meshblocks_geojson()
     
-    # Load and transform crimes data once
+    # Load crimes data
     transformer._load_data()
-    transformer._transform_data()
     
-    # Create tables in sequence to ensure proper foreign key relationships
+    logger.info("Creating crimes table...")
+    transformer._create_crimes_table()
+
     logger.info("Creating suburbs table...")
     transformer._create_suburbs_table()
     
     logger.info("Creating meshblocks table...")
     transformer._create_meshblocks_table()
-    
-    # Ensure meshblocks table is fully created before proceeding
-    if transformer.df_meshblocks is not None:
-        logger.info(f"Meshblocks table created with {len(transformer.df_meshblocks)} records")
-        logger.info("Creating crimes table...")
-        transformer._create_crimes_table()
-    else:
-        logger.error("Failed to create meshblocks table, skipping crimes table creation")
 
-    # Save data to Supabase
+    # # Save data to Supabase
     if transformer.supabase:
         transformer.save_to_supabase()
 
-    # Save data to CSV
+    # #Save data to CSV
     #transformer.save_to_csv()
 
     logger.info("Completed processing all data")

@@ -31,15 +31,24 @@ class SuburbSummary(BaseModel):
     crime_rate_per_1000: float
     crime_trend: str
     total_crimes_12m: int
-    #most_common_crime: str
+    rank_in_region: Optional[int] = None
+    crime_breakdown: Optional[Dict[str, int]] = None
+    trend_3m_change: Optional[float] = None
     report_url: str
+    widget_embed_code: Optional[str] = None
+    summary_text: Optional[str] = None
+    tags: Optional[List[str]] = None
+    geometry: Optional[Dict[str, Any]] = None
+    location_type: Optional[str] = None
+    meshblocks: Optional[List[str]] = None
+    AU2017_name: Optional[str] = None
 
 class SuburbDetail(SuburbSummary):
     rank_in_region: int
     geometry: Optional[Dict[str, Any]] = None
     crime_breakdown: Dict[str, int]
     trend_3m_change: float
-    crimes: List[Dict[str, Any]]
+    #crimes: List[Dict[str, Any]]
     #downloadable_report_url: str
     widget_embed_code: str
     tags: List[str]
@@ -51,10 +60,7 @@ class CrimeEvent(BaseModel):
     offence_description: str
     offence_category: str
     victimisation_date: date
-    district: str
-    area_unit: str
     meshblock_code: Optional[str]
-    location_type: str
 
 class ReportResponse(BaseModel):
     pdf_url: str
@@ -81,7 +87,6 @@ def get_query_params(
     max_crime_rate: Optional[float] = Query(None, description="Maximum crime rate per 1000"),
     min_total_crimes: Optional[int] = Query(None, description="Minimum total crimes in last 12 months"),
     max_total_crimes: Optional[int] = Query(None, description="Maximum total crimes in last 12 months"),
-    #most_common_crime: Optional[str] = Query(None, description="Filter by most common crime type")
 ):
     return {k: v for k, v in locals().items() if v is not None}
 
@@ -126,18 +131,18 @@ async def get_suburb_detail(
     
     suburb = suburb_response.data[0]
     
-    # Get crimes for this suburb with pagination, ordering by date, and limiting to last 12 months
-    crimes_response = (
-        supabase.table("crimes")
-        .select("*")
-        .eq("suburb_id", suburb_id)
-        .order("victimisation_date", desc=True)  # Order by date descending
-        .range((page - 1) * page_size, page * page_size - 1)
-        .execute()
-    )
+    # # Get crimes for this suburb with pagination, ordering by date, and limiting to last 12 months
+    # crimes_response = (
+    #     supabase.table("crimes")
+    #     .select("*")
+    #     .eq("suburb_id", suburb_id)
+    #     .order("victimisation_date", desc=True)  # Order by date descending
+    #     .range((page - 1) * page_size, page * page_size - 1)
+    #     .execute()
+    # )
     
-    # Combine the data
-    suburb["crimes"] = crimes_response.data
+    # # Combine the data
+    # suburb["crimes"] = crimes_response.data
     return suburb
 
 def get_crime_query_params(
