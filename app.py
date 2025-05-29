@@ -984,6 +984,38 @@ class CrimeDataTransformer:
             logger.warning("High memory usage detected, triggering garbage collection")
             gc.collect()
 
+    def print_crime_statistics(self) -> None:
+        """
+        Calculate and print crime statistics including percentiles for crime count and crime rate.
+        """
+        if self.df_suburbs is None or self.df_suburbs.empty:
+            logger.warning("No suburbs data available for statistics calculation")
+            return
+            
+        # Calculate percentiles for crime_rate_per_1000
+        rate_percentiles = self.df_suburbs['crime_rate_per_1000'].quantile([0.25, 0.5, 0.75])
+        total_crimes_percentiles = self.df_suburbs['total_crimes_12m'].quantile([0.25, 0.5, 0.75])
+        
+        # Print statistics
+        logger.info("\nCrime Statistics Summary:")
+        logger.info("-" * 50)
+        logger.info("\nCrime Rate per 1,000 People:")
+        logger.info(f"25th percentile: {rate_percentiles[0.25]:.2f}")
+        logger.info(f"50th percentile (median): {rate_percentiles[0.5]:.2f}")
+        logger.info(f"75th percentile: {rate_percentiles[0.75]:.2f}")
+        
+        logger.info("\nTotal Crimes (12 months):")
+        logger.info(f"25th percentile: {total_crimes_percentiles[0.25]:.0f}")
+        logger.info(f"50th percentile (median): {total_crimes_percentiles[0.5]:.0f}")
+        logger.info(f"75th percentile: {total_crimes_percentiles[0.75]:.0f}")
+        
+        # Additional summary statistics
+        logger.info("\nAdditional Statistics:")
+        logger.info(f"Number of suburbs analyzed: {len(self.df_suburbs)}")
+        logger.info(f"Total crimes in last 12 months: {self.df_suburbs['total_crimes_12m'].sum():,.0f}")
+        logger.info(f"Average crime rate per 1,000 people: {self.df_suburbs['crime_rate_per_1000'].mean():.2f}")
+        logger.info("-" * 50)
+
 def process_large_dataset(input_file: str) -> None:
     """
     Process a large dataset in batches to avoid memory issues
@@ -1015,14 +1047,17 @@ def process_large_dataset(input_file: str) -> None:
     logger.info("Creating suburbs table...")
     transformer._create_suburbs_table()
     
+    # Print crime statistics after creating suburbs table
+    transformer.print_crime_statistics()
+    
     logger.info("Creating meshblocks table...")
     transformer._create_meshblocks_table()
 
-    # # Save data to Supabase
+    # Save data to Supabase
     if transformer.supabase:
         transformer.save_to_supabase()
 
-    # #Save data to CSV
+    # Save data to CSV
     #transformer.save_to_csv()
 
     logger.info("Completed processing all data")

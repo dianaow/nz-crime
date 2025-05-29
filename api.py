@@ -94,7 +94,7 @@ def get_query_params(
 async def get_suburbs(
     params: Dict[str, Any] = Depends(get_query_params),
     page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(50, ge=1, le=100, description="Number of records per page")
+    page_size: int = Query(50, ge=1, le=500, description="Number of records per page")
 ):
     """Get a list of suburbs with summary crime data"""
     query = supabase.table("suburbs").select("*")
