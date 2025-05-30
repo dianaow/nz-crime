@@ -5,12 +5,33 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 import os
 from dotenv import load_dotenv
+import redis
+import json
+from functools import lru_cache
+from fastapi.middleware.gzip import GZipMiddleware
+import time
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(title="NZ Crime API", description="API for accessing New Zealand crime data")
+
+# Add Gzip compression
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Initialize Redis client
+redis_client = redis.Redis(
+    host=os.getenv('REDIS_HOST', 'localhost'),
+    port=int(os.getenv('REDIS_PORT', 6379)),
+    db=0,
+    decode_responses=True
+)
 
 # Initialize Supabase client
 supabase_url = os.getenv("SUPABASE_URL")
@@ -90,6 +111,11 @@ def get_query_params(
 ):
     return {k: v for k, v in locals().items() if v is not None}
 
+def get_cache_key(params: Dict[str, Any], page: int, page_size: int) -> str:
+    """Generate a cache key based on query parameters"""
+    param_str = json.dumps(dict(sorted(params.items())))
+    return f"suburbs:p{page}:s{page_size}:{param_str}"
+
 @app.get("/api/suburbs", response_model=List[SuburbSummary])
 async def get_suburbs(
     params: Dict[str, Any] = Depends(get_query_params),
@@ -97,6 +123,19 @@ async def get_suburbs(
     page_size: int = Query(50, ge=1, le=500, description="Number of records per page")
 ):
     """Get a list of suburbs with summary crime data"""
+    start_time = time.time()
+    
+    # Generate cache key
+    cache_key = get_cache_key(params, page, page_size)
+    
+    # Try to get from cache first
+    cached_data = redis_client.get(cache_key)
+    if cached_data:
+        end_time = time.time()
+        logger.info(f"Cache HIT - Response time: {(end_time - start_time)*1000:.2f}ms")
+        return json.loads(cached_data)
+    
+    # If not in cache, query database
     query = supabase.table("suburbs").select("*")
     
     # Apply all filters from query parameters
@@ -114,6 +153,13 @@ async def get_suburbs(
     query = query.range((page - 1) * page_size, page * page_size - 1)
     
     response = query.execute()
+    
+    # Cache the results for 5 minutes
+    redis_client.setex(cache_key, 300, json.dumps(response.data))
+    
+    end_time = time.time()
+    logger.info(f"Cache MISS - Response time: {(end_time - start_time)*1000:.2f}ms")
+    
     return response.data
 
 @app.get("/api/suburbs/{suburb_id}", response_model=SuburbDetail)
