@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query, Path, Depends
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable
 from datetime import date
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -7,10 +7,11 @@ import os
 from dotenv import load_dotenv
 import redis
 import json
-from functools import lru_cache
+from functools import lru_cache, wraps
 from fastapi.middleware.gzip import GZipMiddleware
 import time
 import logging
+from typing import TypeVar, ParamSpec
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,12 +27,13 @@ app = FastAPI(title="NZ Crime API", description="API for accessing New Zealand c
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Initialize Redis client
-redis_client = redis.Redis(
-    host=os.getenv('REDIS_HOST', 'localhost'),
-    port=int(os.getenv('REDIS_PORT', 6379)),
-    db=0,
-    decode_responses=True
-)
+# redis_client = redis.Redis(
+#     host=os.getenv('REDIS_HOST', 'localhost'),
+#     port=int(os.getenv('REDIS_PORT', 6379)),
+#     db=0,
+#     decode_responses=True
+# )
+redis_client = redis.Redis.from_url(os.getenv('REDIS_URL'))
 
 # Initialize Supabase client
 supabase_url = os.getenv("SUPABASE_URL")
@@ -98,6 +100,50 @@ class Meshblock(BaseModel):
     lat: Optional[float] = None
     lng: Optional[float] = None
 
+# Type variables for generic function typing
+T = TypeVar("T")
+P = ParamSpec("P")
+
+def cache_response(prefix: str, ttl_seconds: int = 300):
+    """
+    Decorator to cache API responses in Redis
+    
+    Args:
+        prefix: Prefix for the cache key
+        ttl_seconds: Time to live in seconds for cached data
+    """
+    def decorator(func: Callable[P, T]) -> Callable[P, T]:
+        @wraps(func)
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+            # Generate cache key from function arguments
+            cache_key = f"{prefix}:"
+            
+            # Add all kwargs to cache key
+            sorted_kwargs = dict(sorted(kwargs.items()))
+            cache_key += json.dumps(sorted_kwargs, sort_keys=True)
+            
+            start_time = time.time()
+            
+            # Try to get from cache
+            cached_data = redis_client.get(cache_key)
+            if cached_data:
+                end_time = time.time()
+                logger.info(f"Cache HIT [{prefix}] - Response time: {(end_time - start_time)*1000:.2f}ms")
+                return json.loads(cached_data)
+            
+            # If not in cache, call the original function
+            result = await func(*args, **kwargs)
+            
+            # Cache the result
+            redis_client.setex(cache_key, ttl_seconds, json.dumps(result))
+            
+            end_time = time.time()
+            logger.info(f"Cache MISS [{prefix}] - Response time: {(end_time - start_time)*1000:.2f}ms")
+            
+            return result
+        return wrapper
+    return decorator
+
 def get_query_params(
     region: Optional[str] = Query(None, description="Filter by region"),
     min_safety_score: Optional[int] = Query(None, description="Minimum safety score (0-100)"),
@@ -117,26 +163,18 @@ def get_cache_key(params: Dict[str, Any], page: int, page_size: int) -> str:
     return f"suburbs:p{page}:s{page_size}:{param_str}"
 
 @app.get("/api/suburbs", response_model=List[SuburbSummary])
+@cache_response(prefix="suburbs_list")
 async def get_suburbs(
     params: Dict[str, Any] = Depends(get_query_params),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(50, ge=1, le=500, description="Number of records per page")
 ):
     """Get a list of suburbs with summary crime data"""
-    start_time = time.time()
-    
-    # Generate cache key
-    cache_key = get_cache_key(params, page, page_size)
-    
-    # Try to get from cache first
-    cached_data = redis_client.get(cache_key)
-    if cached_data:
-        end_time = time.time()
-        logger.info(f"Cache HIT - Response time: {(end_time - start_time)*1000:.2f}ms")
-        return json.loads(cached_data)
-    
-    # If not in cache, query database
-    query = supabase.table("suburbs").select("*")
+    query = supabase.table("suburbs").select(
+        "suburb_id,name,region,council,lat,lng,safety_score,"
+        "crime_rate_per_1000,crime_trend,total_crimes_12m,"
+        "rank_in_region,crime_breakdown,trend_3m_change,report_url"
+    )
     
     # Apply all filters from query parameters
     for field, value in params.items():
@@ -153,16 +191,10 @@ async def get_suburbs(
     query = query.range((page - 1) * page_size, page * page_size - 1)
     
     response = query.execute()
-    
-    # Cache the results for 5 minutes
-    redis_client.setex(cache_key, 300, json.dumps(response.data))
-    
-    end_time = time.time()
-    logger.info(f"Cache MISS - Response time: {(end_time - start_time)*1000:.2f}ms")
-    
     return response.data
 
 @app.get("/api/suburbs/{suburb_id}", response_model=SuburbDetail)
+@cache_response(prefix="suburb_detail", ttl_seconds=600)  # Cache for 10 minutes
 async def get_suburb_detail(
     suburb_id: str = Path(..., description="The ID of the suburb"),
     page: int = Query(1, ge=1, description="Page number"),
@@ -175,21 +207,7 @@ async def get_suburb_detail(
     if not suburb_response.data:
         raise HTTPException(status_code=404, detail="Suburb not found")
     
-    suburb = suburb_response.data[0]
-    
-    # # Get crimes for this suburb with pagination, ordering by date, and limiting to last 12 months
-    # crimes_response = (
-    #     supabase.table("crimes")
-    #     .select("*")
-    #     .eq("suburb_id", suburb_id)
-    #     .order("victimisation_date", desc=True)  # Order by date descending
-    #     .range((page - 1) * page_size, page * page_size - 1)
-    #     .execute()
-    # )
-    
-    # # Combine the data
-    # suburb["crimes"] = crimes_response.data
-    return suburb
+    return suburb_response.data[0]
 
 def get_crime_query_params(
     offence_category: Optional[str] = Query(None, description="Filter by crime type"),
@@ -206,6 +224,7 @@ def get_crime_query_params(
     return {k: v for k, v in locals().items() if v is not None}
 
 @app.get("/api/crimes", response_model=List[CrimeEvent])
+@cache_response(prefix="crimes_list", ttl_seconds=1800)  # Cache for 30 minutes
 async def get_crimes(params: Dict[str, Any] = Depends(get_crime_query_params)):
     """Get crime events with optional filtering"""
     query = supabase.table("crimes").select("*")
@@ -256,6 +275,7 @@ async def get_suburb_widget(
     }
 
 @app.get("/api/meshblocks", response_model=List[Meshblock])
+@cache_response(prefix="meshblocks_list", ttl_seconds=3600)  # Cache for 1 hour
 async def get_meshblocks(
     suburb_id: str = Query(..., description="Filter meshblocks by suburb ID")
 ):

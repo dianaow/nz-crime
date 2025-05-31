@@ -3,7 +3,8 @@
 Shapefile to GeoJSON Converter
 
 This script converts ESRI Shapefiles (.shp) to GeoJSON format.
-It supports optional geometry simplification for better web performance.
+It supports optional geometry simplification for better web performance,
+sorting by columns, and splitting into batches.
 """
 
 import argparse
@@ -18,7 +19,9 @@ def convert_shapefile_to_geojson(
     input_path: str,
     output_path: Optional[str] = None,
     simplify: bool = False,
-    tolerance: float = 0.001
+    tolerance: float = 0.001,
+    sort_column: Optional[str] = None,
+    batch_size: Optional[int] = None
 ) -> None:
     """
     Convert a shapefile to GeoJSON format.
@@ -29,6 +32,8 @@ def convert_shapefile_to_geojson(
                                    will use the input filename with .geojson extension
         simplify (bool): Whether to simplify the geometry for better web performance
         tolerance (float): Tolerance value for geometry simplification
+        sort_column (str, optional): Column name to sort the data by
+        batch_size (int, optional): Number of features per batch file
     """
     try:
         # Validate input file exists
@@ -46,12 +51,18 @@ def convert_shapefile_to_geojson(
         print(f"Reading shapefile: {input_path}")
         gdf = gpd.read_file(input_path)
         
+        # Sort the data if requested
+        if sort_column:
+            if sort_column not in gdf.columns:
+                raise ValueError(f"Sort column '{sort_column}' not found in the data")
+            print(f"Sorting data by column: {sort_column}")
+            gdf = gdf.sort_values(by=sort_column)
+
         # Print the current coordinate system
         print(f"Input coordinate system: {gdf.crs}")
 
         # Calculate centroids using a projected CRS first for accurate calculation
         print("Calculating centroids for each polygon...")
-        # Store original CRS to return to it after centroid calculation
         original_crs = gdf.crs
         
         # Project to a suitable projected CRS (e.g., Web Mercator) for centroid calculation
@@ -70,12 +81,6 @@ def convert_shapefile_to_geojson(
         gdf['longitude'] = centroids.x
         gdf['latitude'] = centroids.y
 
-        # Print a sample of the coordinates for verification
-        print("\nSample coordinates:")
-        sample = gdf.head(1)
-        print(f"Longitude: {sample['longitude'].values[0]}")
-        print(f"Latitude: {sample['latitude'].values[0]}")
-
         # Simplify geometry if requested
         if simplify:
             print(f"Simplifying geometry with tolerance: {tolerance}")
@@ -84,11 +89,33 @@ def convert_shapefile_to_geojson(
                 preserve_topology=True
             )
 
-        # Save as GeoJSON
-        print(f"Saving to GeoJSON: {output_path}")
-        gdf.to_file(output_path, driver="GeoJSON")
-        print("Conversion completed successfully!")
-        print(f"Added latitude and longitude columns to the output file.")
+        # Save as single file or multiple batches
+        if batch_size is None:
+            # Save as single GeoJSON
+            print(f"Saving to GeoJSON: {output_path}")
+            gdf.to_file(output_path, driver="GeoJSON")
+            print("Conversion completed successfully!")
+        else:
+            # Save in batches
+            total_features = len(gdf)
+            num_batches = (total_features + batch_size - 1) // batch_size
+            print(f"Splitting into {num_batches} batches of {batch_size} features each")
+            
+            output_stem = output_path.stem
+            output_parent = output_path.parent
+            
+            for i in range(num_batches):
+                start_idx = i * batch_size
+                end_idx = min((i + 1) * batch_size, total_features)
+                batch_df = gdf.iloc[start_idx:end_idx]
+                
+                batch_filename = output_parent / f"{output_stem}_batch_{i+1}.geojson"
+                print(f"Saving batch {i+1} to: {batch_filename}")
+                batch_df.to_file(batch_filename, driver="GeoJSON")
+            
+            print(f"Successfully saved {num_batches} batch files!")
+
+        print(f"Added latitude and longitude columns to the output file(s).")
 
     except Exception as e:
         print(f"Error: {str(e)}", file=sys.stderr)
@@ -117,6 +144,15 @@ def main():
         default=0.001,
         help="Tolerance value for geometry simplification (default: 0.001)"
     )
+    parser.add_argument(
+        "--sort",
+        help="Column name to sort the data by"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        help="Number of features per batch file (e.g., 500)"
+    )
 
     args = parser.parse_args()
     
@@ -124,7 +160,9 @@ def main():
         input_path=args.input_file,
         output_path=args.output,
         simplify=args.simplify,
-        tolerance=args.tolerance
+        tolerance=args.tolerance,
+        sort_column=args.sort,
+        batch_size=args.batch_size
     )
 
 if __name__ == "__main__":
