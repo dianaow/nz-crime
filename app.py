@@ -1048,7 +1048,7 @@ def process_large_dataset(input_file: str) -> None:
     transformer._create_suburbs_table()
     
     # Print crime statistics after creating suburbs table
-    transformer.print_crime_statistics()
+    #transformer.print_crime_statistics()
     
     logger.info("Creating meshblocks table...")
     transformer._create_meshblocks_table()

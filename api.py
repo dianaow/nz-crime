@@ -9,6 +9,7 @@ import redis
 import json
 from functools import lru_cache, wraps
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 import time
 import logging
 from typing import TypeVar, ParamSpec
@@ -22,6 +23,15 @@ load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(title="NZ Crime API", description="API for accessing New Zealand crime data")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 
 # Add Gzip compression
 app.add_middleware(GZipMiddleware, minimum_size=1000)
@@ -163,7 +173,7 @@ def get_cache_key(params: Dict[str, Any], page: int, page_size: int) -> str:
     return f"suburbs:p{page}:s{page_size}:{param_str}"
 
 @app.get("/api/suburbs", response_model=List[SuburbSummary])
-@cache_response(prefix="suburbs_list")
+@cache_response(prefix="suburbs_list", ttl_seconds=86400)
 async def get_suburbs(
     params: Dict[str, Any] = Depends(get_query_params),
     page: int = Query(1, ge=1, description="Page number"),
@@ -194,7 +204,7 @@ async def get_suburbs(
     return response.data
 
 @app.get("/api/suburbs/{suburb_id}", response_model=SuburbDetail)
-@cache_response(prefix="suburb_detail", ttl_seconds=600)  # Cache for 10 minutes
+@cache_response(prefix="suburb_detail", ttl_seconds=86400)  # Cache for 1 day
 async def get_suburb_detail(
     suburb_id: str = Path(..., description="The ID of the suburb"),
     page: int = Query(1, ge=1, description="Page number"),
@@ -224,7 +234,7 @@ def get_crime_query_params(
     return {k: v for k, v in locals().items() if v is not None}
 
 @app.get("/api/crimes", response_model=List[CrimeEvent])
-@cache_response(prefix="crimes_list", ttl_seconds=1800)  # Cache for 30 minutes
+@cache_response(prefix="crimes_list", ttl_seconds=86400)  # Cache for 1 day
 async def get_crimes(params: Dict[str, Any] = Depends(get_crime_query_params)):
     """Get crime events with optional filtering"""
     query = supabase.table("crimes").select("*")
@@ -275,7 +285,7 @@ async def get_suburb_widget(
     }
 
 @app.get("/api/meshblocks", response_model=List[Meshblock])
-@cache_response(prefix="meshblocks_list", ttl_seconds=3600)  # Cache for 1 hour
+@cache_response(prefix="meshblocks_list", ttl_seconds=86400)  # Cache for 1 day
 async def get_meshblocks(
     suburb_id: str = Query(..., description="Filter meshblocks by suburb ID")
 ):
