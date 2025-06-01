@@ -114,22 +114,27 @@ class Meshblock(BaseModel):
 T = TypeVar("T")
 P = ParamSpec("P")
 
-def cache_response(prefix: str, ttl_seconds: int = 300):
+def cache_response(prefix: str, ttl_seconds: int = 300, exclude_params: List[str] = None):
     """
     Decorator to cache API responses in Redis
     
     Args:
         prefix: Prefix for the cache key
         ttl_seconds: Time to live in seconds for cached data
+        exclude_params: List of parameter names to exclude from cache key
     """
+    if exclude_params is None:
+        exclude_params = []
+        
     def decorator(func: Callable[P, T]) -> Callable[P, T]:
         @wraps(func)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
             # Generate cache key from function arguments
             cache_key = f"{prefix}:"
             
-            # Add all kwargs to cache key
-            sorted_kwargs = dict(sorted(kwargs.items()))
+            # Filter out excluded parameters
+            filtered_kwargs = {k: v for k, v in kwargs.items() if k not in exclude_params}
+            sorted_kwargs = dict(sorted(filtered_kwargs.items()))
             cache_key += json.dumps(sorted_kwargs, sort_keys=True)
             
             start_time = time.time()
@@ -137,15 +142,24 @@ def cache_response(prefix: str, ttl_seconds: int = 300):
             # Try to get from cache
             cached_data = redis_client.get(cache_key)
             if cached_data:
-                end_time = time.time()
-                logger.info(f"Cache HIT [{prefix}] - Response time: {(end_time - start_time)*1000:.2f}ms")
-                return json.loads(cached_data)
+                try:
+                    result = json.loads(cached_data)
+                    end_time = time.time()
+                    logger.info(f"Cache HIT [{prefix}] - Response time: {(end_time - start_time)*1000:.2f}ms")
+                    return result
+                except json.JSONDecodeError:
+                    # If cached data is corrupted, remove it
+                    redis_client.delete(cache_key)
+                    logger.warning(f"Corrupted cache data removed for key: {cache_key}")
             
             # If not in cache, call the original function
             result = await func(*args, **kwargs)
             
             # Cache the result
-            redis_client.setex(cache_key, ttl_seconds, json.dumps(result))
+            try:
+                redis_client.setex(cache_key, ttl_seconds, json.dumps(result, default=str))
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Failed to cache result: {e}")
             
             end_time = time.time()
             logger.info(f"Cache MISS [{prefix}] - Response time: {(end_time - start_time)*1000:.2f}ms")
@@ -180,11 +194,7 @@ async def get_suburbs(
     page_size: int = Query(50, ge=1, le=500, description="Number of records per page")
 ):
     """Get a list of suburbs with summary crime data"""
-    query = supabase.table("suburbs").select(
-        "suburb_id,name,region,council,lat,lng,safety_score,"
-        "crime_rate_per_1000,crime_trend,total_crimes_12m,"
-        "rank_in_region,crime_breakdown,trend_3m_change,report_url"
-    )
+    query = supabase.table("suburbs").select("*")
     
     # Apply all filters from query parameters
     for field, value in params.items():
@@ -297,3 +307,17 @@ async def get_meshblocks(
         raise HTTPException(status_code=404, detail="No meshblocks found for this suburb")
     
     return response.data 
+
+@app.delete("/api/cache/clear")
+async def clear_cache():
+    """Clear all cached data"""
+    try:
+        # Clear all keys matching the suburbs pattern
+        keys = redis_client.keys("suburbs_list:*")
+        if keys:
+            redis_client.delete(*keys)
+            return {"message": f"Cleared {len(keys)} cache entries"}
+        else:
+            return {"message": "No cache entries found"}
+    except Exception as e:
+        return {"error": str(e)}
