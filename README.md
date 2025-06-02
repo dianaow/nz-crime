@@ -1,6 +1,6 @@
 # NZ Crime Data Processing & API System
 
-A high-performance data processing and API system for New Zealand crime statistics, featuring optimized data ingestion, caching, and efficient geographic data handling.
+A data processing and API system for New Zealand crime statistics, featuring optimized data ingestion, caching, and efficient geographic data handling.
 
 ## 📋 Table of Contents
 
@@ -16,6 +16,7 @@ A high-performance data processing and API system for New Zealand crime statisti
 - [API Endpoints](#api-endpoints)
 - [Configuration](#configuration)
 
+
 ## 🎯 Overview
 
 This system processes large-scale New Zealand crime data, transforms it for efficient storage in Supabase, and provides a high-performance API with caching. The system is designed to handle millions of crime records while maintaining sub-second response times.
@@ -23,11 +24,12 @@ This system processes large-scale New Zealand crime data, transforms it for effi
 ### Key Features
 
 - **Parallel Processing**: Multi-threaded data transformation and ingestion
-- **Intelligent Caching**: Redis-based caching with automatic invalidation
+- **Redis Caching**: Redis-based caching with automatic invalidation
 - **Geographic Integration**: Shapefile processing with centroid calculation
 - **Memory Optimization**: Chunked processing to handle large datasets
 - **Error Resilience**: Retry mechanisms and graceful error handling
 - **Performance Monitoring**: Built-in memory usage tracking and logging
+
 
 ## 🏗️ System Architecture
 
@@ -44,6 +46,7 @@ This system processes large-scale New Zealand crime data, transforms it for effi
 │                 │    │   (api.py)      │    │                 │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
 ```
+
 
 ## 🔧 Components
 
@@ -105,13 +108,15 @@ def _save_batch_to_supabase(self, batch_data: List[Dict], table_name: str, use_u
 
 ### `api.py` - High-Performance API
 
-A FastAPI-based REST API optimized for high-throughput data retrieval with intelligent caching.
+A FastAPI-based REST API optimized for high-throughput data retrieval with redis caching.
 
-#### **Key Functionality**
+#### Core Endpoints
+- `GET /api/suburbs` - Returns a list of suburbs with summary crime data (with filtering and pagination)
+- `GET /api/suburbs/{suburb_id}` - Full details for one suburb
+- `GET /api/crimes` - Crime events with advanced filtering
+- `GET /api/meshblocks` - Geographic meshblock data
+- `DELETE /api/cache/clear` - Cache management
 
-- **Suburb Data API**: Comprehensive suburb information with crime statistics with geogr 
-- **Crime Events API**: Individual crime record access with filtering
-- **Report Generation**: PDF report URLs and widget embed codes
 
 #### **Performance Optimizations**
 
@@ -130,7 +135,6 @@ async def get_suburbs(params: Dict[str, Any] = Depends(get_query_params)):
 - **Redis Caching**: All API responses cached with configurable TTL
 - **Parameter-Based Keys**: Cache keys include query parameters for precise cache hits
 - **Cache Invalidation**: Automatic cache clearing endpoints
-- **Hit Rate Optimization**: 24-hour cache for static data, shorter TTL for dynamic content
 
 ##### 🔍 **Query Optimization**
 
@@ -151,14 +155,15 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"])
 
 ### `convert_shpfile.py` - Geographic Data Converter
 
-Specialized tool for converting ESRI Shapefiles to optimized GeoJSON format with performance enhancements.
+Specialized script for converting ESRI Shapefiles to optimized GeoJSON format with performance enhancements.
 
 #### **Key Functionality**
 
 - **Shapefile Conversion**: ESRI Shapefile to GeoJSON transformation
-- **Coordinate System Transformation**: Automatic projection to WGS84
+- **Coordinate System Transformation**: Automatic projection to WGS84 (EPSG:4326)
 - **Centroid Calculation**: Accurate geographic center calculation
 - **Geometry Simplification**: Optional polygon simplification for web performance
+
 
 ## 🚀 Performance Optimizations Summary
 
@@ -200,9 +205,8 @@ SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
 REDIS_URL=redis://localhost:6379
 ```
 
-### Database Setup
-
-
+### Database Schema
+![database schema](./database-schema.png)
 
 ## 🚀 Usage
 
@@ -230,14 +234,6 @@ python performance_monitor.py
 python benchmark_examples.py
 ```
 
-## 📡 API Endpoints
-
-### Core Endpoints
-- `GET /api/suburbs` - List suburbs with filtering and pagination
-- `GET /api/suburbs/{suburb_id}` - Detailed suburb information
-- `GET /api/crimes` - Crime events with advanced filtering
-- `GET /api/meshblocks` - Geographic meshblock data
-- `DELETE /api/cache/clear` - Cache management
 
 ## ⚙️ Configuration
 
