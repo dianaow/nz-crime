@@ -20,6 +20,10 @@ from functools import lru_cache
 import psutil
 import gc
 import random
+from pydantic import BaseModel, field_validator, Field, ValidationError
+from typing import Union
+import math
+import re
 
 # Load environment variables
 load_dotenv()
@@ -35,6 +39,178 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Data validation schemas
+class CrimeRecordSchema(BaseModel):
+    """Schema for validating individual crime records"""
+    event_id: str = Field(..., min_length=1, description="Unique event identifier")
+    suburb_id: str = Field(..., min_length=1, description="Suburb identifier")
+    victimisation_date: str = Field(..., pattern=r'^\d{4}-\d{2}-\d{2}$', description="Date in YYYY-MM-DD format")
+    offence_code: Optional[str] = Field(None, max_length=10, description="Offence code")
+    offence_category: Optional[str] = Field(None, max_length=200, description="Offence category")
+    offence_description: Optional[str] = Field(None, max_length=500, description="Offence description")
+    meshblock_code: Optional[str] = Field(None, description="Meshblock code")
+    AU2017_name: Optional[str] = Field(None, max_length=200, description="Area Unit 2017 name")
+
+class SuburbRecordSchema(BaseModel):
+    """Schema for validating suburb records"""
+    suburb_id: str = Field(..., min_length=1, description="Suburb identifier")
+    AU2017_name: Optional[str] = Field(None, max_length=200, description="Area Unit 2017 name")
+    name: str = Field(..., min_length=1, max_length=200, description="Suburb name")
+    slug: str = Field(..., min_length=1, max_length=250, description="URL-friendly suburb slug")
+    region: Optional[str] = Field(None, max_length=100, description="Region name")
+    council: Optional[str] = Field(None, max_length=100, description="Council name")
+    location_type: Optional[str] = Field(None, max_length=50, description="Location type")
+    lat: Optional[float] = Field(None, ge=-90, le=90, description="Latitude")
+    lng: Optional[float] = Field(None, ge=-180, le=180, description="Longitude")
+    geometry: Optional[str] = Field(None, description="WKT geometry string")
+    safety_score: float = Field(0, ge=0, le=100, description="Safety score")
+    crime_rate_per_1000: float = Field(0, ge=0, description="Crime rate per 1000 people")
+    total_crimes_12m: int = Field(0, ge=0, le=32767, description="Total crimes in last 12 months")
+    crime_trend: str = Field(..., pattern=r'^(up|down|flat)$', description="Crime trend")
+    rank_in_region: int = Field(0, ge=0, description="Rank in region")
+    crime_breakdown: Union[str, dict] = Field(default_factory=dict, description="Crime breakdown by type")
+    trend_3m_change: float = Field(0, description="3-month trend change percentage")
+    peak_crime_months: List[str] = Field(default_factory=list, description="Peak crime months as ISO date strings")
+    report_url: str = Field('', description="Report URL")
+    widget_embed_code: str = Field('', description="Widget embed code")
+    summary_text: str = Field('', description="Summary text")
+    tags: List[str] = Field(default_factory=list, description="Tags")
+    nearby_suburbs: List[dict] = Field(default_factory=list, description="Nearby suburbs data")
+
+class MeshblockRecordSchema(BaseModel):
+    """Schema for validating meshblock records"""
+    id: str = Field(..., min_length=1, description="Meshblock ID")
+    suburb_id: str = Field(..., min_length=1, description="Suburb identifier")
+    crime_count: int = Field(0, ge=0, description="Crime count")
+    lat: Optional[float] = Field(None, ge=-90, le=90, description="Latitude")
+    lng: Optional[float] = Field(None, ge=-180, le=180, description="Longitude")
+    geometry: Optional[str] = Field(None, description="WKT geometry string")
+
+
+def validate_crime_records(records: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Validate a list of crime records and return valid records and errors
+    
+    Args:
+        records: List of crime record dictionaries
+        
+    Returns:
+        Tuple of (valid_records, error_records)
+    """
+    valid_records = []
+    error_records = []
+    
+    for record in records:
+        try:
+            validated_record = CrimeRecordSchema(**record)
+            valid_records.append(validated_record.dict())
+        except ValidationError as e:
+            error_record = {
+                'original_record': record,
+                'validation_errors': e.errors()
+            }
+            error_records.append(error_record)
+            logger.warning(f"Crime record validation failed: {e}")
+    
+    return valid_records, error_records
+
+def validate_suburb_records(records: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Validate a list of suburb records and return valid records and errors
+    
+    Args:
+        records: List of suburb record dictionaries
+        
+    Returns:
+        Tuple of (valid_records, error_records)
+    """
+    valid_records = []
+    error_records = []
+    
+    for record in records:
+        try:
+            validated_record = SuburbRecordSchema(**record)
+            valid_records.append(validated_record.dict())
+        except ValidationError as e:
+            error_record = {
+                'original_record': record,
+                'validation_errors': e.errors()
+            }
+            error_records.append(error_record)
+            logger.warning(f"Suburb record validation failed: {e}")
+    
+    return valid_records, error_records
+
+def validate_meshblock_records(records: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Validate a list of meshblock records and return valid records and errors
+    
+    Args:
+        records: List of meshblock record dictionaries
+        
+    Returns:
+        Tuple of (valid_records, error_records)
+    """
+    valid_records = []
+    error_records = []
+    
+    for record in records:
+        try:
+            validated_record = MeshblockRecordSchema(**record)
+            valid_records.append(validated_record.dict())
+        except ValidationError as e:
+            error_record = {
+                'original_record': record,
+                'validation_errors': e.errors()
+            }
+            error_records.append(error_record)
+            logger.warning(f"Meshblock record validation failed: {e}")
+    
+    return valid_records, error_records
+
+def calculate_peak_crime_months(suburb_df: pd.DataFrame, top_n: int = 3) -> List[str]:
+    """
+    Calculate peak crime months for a suburb
+    
+    Args:
+        suburb_df: DataFrame containing crime data for a suburb
+        top_n: Number of top months to return (default: 3)
+        
+    Returns:
+        List of ISO date strings representing the first day of peak crime months
+    """
+    if suburb_df.empty:
+        return []
+    
+    try:
+        # Ensure Date column exists and is datetime
+        if 'Date' not in suburb_df.columns:
+            suburb_df['Date'] = pd.to_datetime(suburb_df['victimisation_date'])
+        
+        # Group by year-month and count crimes
+        suburb_df['YearMonth'] = suburb_df['Date'].dt.to_period('M')
+        monthly_crimes = suburb_df.groupby('YearMonth').size()
+        
+        # Get the top N months with highest crime counts
+        peak_months = monthly_crimes.nlargest(top_n)
+        
+        # Convert Period objects to datetime (first day of each month) and then to ISO strings
+        peak_month_dates = []
+        for period in peak_months.index:
+            # Convert Period to datetime (first day of the month)
+            month_start = period.to_timestamp()
+            # Convert to ISO string format (YYYY-MM-DD)
+            peak_month_dates.append(month_start.strftime('%Y-%m-%d'))
+        
+        # Sort the dates chronologically
+        peak_month_dates.sort()
+        
+        return peak_month_dates
+        
+    except Exception as e:
+        logger.warning(f"Error calculating peak crime months: {str(e)}")
+        return []
+
 class CrimeDataTransformer:
     def __init__(self, input_file: str, output_dir: str = 'output'):
         """
@@ -49,7 +225,7 @@ class CrimeDataTransformer:
         self.df_crime = None
         self.df_suburbs = None
         self.df_crimes = None
-        self.df_census = None
+        self.census_df = None
         self.geo_df = None
         self.geo_lookup = {}
         self.suburbs_geojson = None
@@ -97,30 +273,6 @@ class CrimeDataTransformer:
         
         logger.info(f"Loaded {len(self.df_crime)} crime records")
 
-    def _load_data_in_chunks(self, file_path: str, chunk_size: int = 10000) -> Generator[pd.DataFrame, None, None]:
-        """
-        Load data in chunks to manage memory usage
-        
-        Args:
-            file_path: Path to the CSV file
-            chunk_size: Size of each chunk to read
-            
-        Returns:
-            Generator yielding DataFrame chunks
-        """
-        encodings = ['utf-8', 'utf-16', 'latin1', 'iso-8859-1', 'cp1252']
-        
-        for encoding in encodings:
-            try:
-                for chunk in pd.read_csv(file_path, encoding=encoding, sep='\t', chunksize=chunk_size):
-                    yield chunk
-                break
-            except UnicodeDecodeError:
-                continue
-            except Exception as e:
-                logger.error(f"Error reading file with {encoding} encoding: {str(e)}")
-                continue
-
     def _load_census_data(self) -> None:
         """Load census data for population information"""
         census_file = os.path.join(os.path.dirname(self.input_file), 'nzcensus.csv')
@@ -142,7 +294,7 @@ class CrimeDataTransformer:
         geo_file = os.path.join(os.path.dirname(self.input_file), 'geographic-areas-table-2023.csv')
         if os.path.exists(geo_file):
             # Only load the columns we need to save memory
-            self.geo_df = pd.read_csv(geo_file, usecols=['AU2017_name', 'AU2017_name', 'SA22023_code', 'SA22023_name_ascii', 'REGC2023_name', 'TA2023_name', 'MB2023_code', 'MB2013_code', 'UR2023_name'])
+            self.geo_df = pd.read_csv(geo_file, usecols=['AU2017_name', 'AU2017_name', 'SA22023_code', 'SA22023_name', 'SA22023_name_ascii', 'REGC2023_name', 'TA2023_name', 'MB2023_code', 'MB2013_code', 'UR2023_name'])
             # Create a lookup dictionary for suburb matching
             self.geo_lookup = {}
             meshblock_lookup = {}
@@ -169,8 +321,9 @@ class CrimeDataTransformer:
                 suburb_name = row['AU2017_name']
                 if suburb_name and not pd.isna(suburb_name):
                     self.geo_lookup[suburb_name] = {
-                        'SA22023_code': row['SA22023_code'],
+                        'SA22023_code': str(row['SA22023_code']),
                         'SA22023_name': row['SA22023_name_ascii'],
+                        'SA22023_name_orig': row['SA22023_name'],
                         'REGC2023_name': row['REGC2023_name'],
                         'TA2023_name': row['TA2023_name'],
                         'UR2023_name': row['UR2023_name'],
@@ -179,20 +332,20 @@ class CrimeDataTransformer:
             
             # Analyze the mapping distribution in geo file
             # Analyze the mapping distribution in geo file
-            geo_mapping_counts = self.geo_df.groupby('AU2017_name')['SA22023_name_ascii'].nunique()
-            logger.info("\nA=SA22023 to AU2017 mapping distribution in geo file:")
-            logger.info(f"Number of AU2017 areas with 1 SA2023: {len(geo_mapping_counts[geo_mapping_counts == 1])}")
-            logger.info(f"Number of AU2017 areas with 2-5 SA2023: {len(geo_mapping_counts[(geo_mapping_counts > 1) & (geo_mapping_counts <= 5)])}")
-            logger.info(f"Number of AU2017 areas with >5 SA2023: {len(geo_mapping_counts[geo_mapping_counts > 5])}")
+            # geo_mapping_counts = self.geo_df.groupby('AU2017_name')['SA22023_name_ascii'].nunique()
+            # logger.info("\nA=SA22023 to AU2017 mapping distribution in geo file:")
+            # logger.info(f"Number of AU2017 areas with 1 SA2023: {len(geo_mapping_counts[geo_mapping_counts == 1])}")
+            # logger.info(f"Number of AU2017 areas with 2-5 SA2023: {len(geo_mapping_counts[(geo_mapping_counts > 1) & (geo_mapping_counts <= 5)])}")
+            # logger.info(f"Number of AU2017 areas with >5 SA2023: {len(geo_mapping_counts[geo_mapping_counts > 5])}")
             
-            geo_mapping_counts1 = self.geo_df.groupby('SA22023_name_ascii')['AU2017_name'].nunique()
-            logger.info("\nAU2017 to SA22023 mapping distribution in geo file:")
-            logger.info(f"Number of SA22023 areas with 1 AU2017: {len(geo_mapping_counts1[geo_mapping_counts1 == 1])}")
-            logger.info(f"Number of SA22023 areas with 2-5 AU2017: {len(geo_mapping_counts1[(geo_mapping_counts1 > 1) & (geo_mapping_counts <= 5)])}")
-            logger.info(f"Number of SA22023 areas with >5 AU2017: {len(geo_mapping_counts1[geo_mapping_counts1 > 5])}")
+            # geo_mapping_counts1 = self.geo_df.groupby('SA22023_name_ascii')['AU2017_name'].nunique()
+            # logger.info("\nAU2017 to SA22023 mapping distribution in geo file:")
+            # logger.info(f"Number of SA22023 areas with 1 AU2017: {len(geo_mapping_counts1[geo_mapping_counts1 == 1])}")
+            # logger.info(f"Number of SA22023 areas with 2-5 AU2017: {len(geo_mapping_counts1[(geo_mapping_counts1 > 1) & (geo_mapping_counts <= 5)])}")
+            # logger.info(f"Number of SA22023 areas with >5 AU2017: {len(geo_mapping_counts1[geo_mapping_counts1 > 5])}")
             
-            logger.info(f"Created lookup for {len(self.geo_lookup)} suburbs with meshblock codes")
-            logger.info(f"Created lookup for {len(self.meshblock_lookup)} meshblock codes")
+            # logger.info(f"Created lookup for {len(self.geo_lookup)} suburbs with meshblock codes")
+            # logger.info(f"Created lookup for {len(self.meshblock_lookup)} meshblock codes")
         else:
             logger.warning(f"Geographic areas file not found: {geo_file}")
             self.geo_df = pd.DataFrame()
@@ -252,31 +405,7 @@ class CrimeDataTransformer:
             logger.error(f"Error loading meshblocks geojson data: {str(e)}")
             self.meshblocks_geojson = None
             self.meshblock_geometries = {}
-    
-    def _clean_text(self, text: str) -> str:
-        """
-        Clean text by removing special characters and normalizing spaces
-        
-        Args:
-            text: Input text to clean
             
-        Returns:
-            Cleaned text string
-        """
-        if pd.isna(text):
-            return text
-            
-        # Replace special characters with spaces
-        text = str(text)
-        text = text.replace('.', ' ')  # Replace dots with spaces
-        # text = text.replace('-', ' ')  # Replace hyphens with spaces
-        # text = text.replace('_', ' ')  # Replace underscores with spaces
-        
-        # Normalize spaces (replace multiple spaces with single space)
-        text = ' '.join(text.split())
-        
-        return text.strip()
-        
     def _create_crimes_table(self) -> None:
         """Create the crimes table with individual crime records using parallel processing"""
         if self.df_crime is None or self.df_crime.empty:
@@ -293,8 +422,8 @@ class CrimeDataTransformer:
             chunk[text_columns] = chunk[text_columns].apply(lambda x: x.str.strip())
             
             # Clean special characters from Area Unit and Territorial Authority columns
-            chunk['Area Unit'] = chunk['Area Unit'].apply(self._clean_text)
-            chunk['Territorial Authority'] = chunk['Territorial Authority'].apply(self._clean_text)
+            chunk['Area Unit'] = chunk['Area Unit'].apply(clean_text)
+            chunk['Territorial Authority'] = chunk['Territorial Authority'].apply(clean_text)
 
             # Convert suburb name and suburb_id columns to 2023 format using vectorized operations
             chunk['suburb_id'] = chunk['Area Unit'].map(lambda x: self.geo_lookup.get(x, {}).get('SA22023_code', ''))
@@ -343,7 +472,7 @@ class CrimeDataTransformer:
                     
                 crime_record = {
                     'event_id': str(uuid.uuid4()),
-                    'suburb_id': row['suburb_id'],
+                    'suburb_id': str(row['suburb_id']),
                     'victimisation_date': row['victimisation_date'],
                     'offence_code': row['offence_code'] if row['offence_code'] else None,
                     'offence_category': row['ANZSOC Division'] if pd.notna(row['ANZSOC Division']) else None,
@@ -398,6 +527,23 @@ class CrimeDataTransformer:
         
         logger.info(f"Created {len(self.df_crimes)} crime records using parallel processing")
 
+        # Validate crime records
+        logger.info("Validating crime records...")
+        crimes_dict_list = self.df_crimes.to_dict('records')
+        valid_crimes, invalid_crimes = validate_crime_records(crimes_dict_list)
+        
+        if invalid_crimes:
+            logger.warning(f"Found {len(invalid_crimes)} invalid crime records")
+            # Save invalid records for debugging
+            invalid_crimes_file = os.path.join(self.output_dir, 'invalid_crime_records.json')
+            with open(invalid_crimes_file, 'w') as f:
+                json.dump(invalid_crimes, f, indent=2, default=str)
+            logger.info(f"Invalid crime records saved to {invalid_crimes_file}")
+        
+        # Update DataFrame with only valid records
+        self.df_crimes = pd.DataFrame(valid_crimes)
+        logger.info(f"Retained {len(self.df_crimes)} valid crime records after validation")
+
     @lru_cache(maxsize=1000)
     def _get_suburb_geometry(self, suburb_name: str) -> Tuple[float, float, Dict]:
         """
@@ -430,22 +576,24 @@ class CrimeDataTransformer:
         Returns:
             Population count for the suburb
         """
-        if self.df_census is None:
-            #print("Census data not loaded", suburb_name)
+
+        if self.census_df is None:
+            #print("Census data not loaded")
             return 10000  # Fallback to placeholder if census data not loaded
             
         # Try to find exact match
-        match = self.df_census[(self.df_census['Area'] == suburb_name) & (self.df_census['Year'] == 2023)]
+        match = self.census_df  [(self.census_df['Area'] == suburb_name) & (self.census_df['Census year'] == 2023)]
         if not match.empty:
             return match['Value'].iloc[0]
             
         # If no exact match, try to find partial match
         # This handles cases where the names might be slightly different
-        for area in self.df_census['Area']:
+        for area in self.census_df['Area']:
             if suburb_name.lower() in area.lower() or area.lower() in suburb_name.lower():
-                return self.df_census[self.df_census['Area'] == area]['Value'].iloc[0]
+                return self.census_df[self.census_df['Area'] == area]['Value'].iloc[0]
                 
         # If no match found, return placeholder
+        print(f"No match found for {suburb_name}")
         return 10000
               
     def _process_suburb_batch(self, suburb_data_input: List[Dict]) -> List[Dict]:
@@ -467,7 +615,7 @@ class CrimeDataTransformer:
             try:
                 # Calculate crime statistics using victimisation_date
                 suburb_df['Date'] = pd.to_datetime(suburb_df['victimisation_date'])
-                current_date = datetime.now()
+                current_date = item['reference_date']
                 one_year_ago = current_date - timedelta(days=365)
                 last_12m_data = suburb_df[suburb_df['Date'] >= one_year_ago]
                 total_crimes_12m = len(last_12m_data)
@@ -497,24 +645,29 @@ class CrimeDataTransformer:
                 
                 crime_breakdown = suburb_df.groupby('offence_code').size().to_dict()
                 
+                # Calculate peak crime months (top 3 months with highest crime counts)
+                peak_crime_months = calculate_peak_crime_months(suburb_df, top_n=3)
+                
                 # Get geographic data from the lookup
                 geo_data = self.geo_lookup.get(suburb_name, {})
                 suburb_id = geo_data.get('SA22023_code') or str(uuid.uuid5(uuid.NAMESPACE_DNS, suburb_name))
                 suburb_name_2023 = geo_data.get('SA22023_name', suburb_name)
+                suburb_name_2023_orig = geo_data.get('SA22023_name_orig', suburb_name)
                 region = geo_data.get('REGC2023_name')
                 council = geo_data.get('TA2023_name', '')
                 location_type = geo_data.get('UR2023_name', '')
                 #meshblocks = geo_data.get('meshblocks', [])
 
                 # Calculate crime rate based on suburb population
-                population = self._get_suburb_population(suburb_name_2023)
+                population = self._get_suburb_population(suburb_name_2023_orig)
                 crime_rate_per_1000 = (total_crimes_12m / population) * 1000 if population > 0 else 0
                 
                 # Create the suburb data dictionary
                 suburb_data = {
-                    'suburb_id': suburb_id,
+                    'suburb_id': str(suburb_id),
                     'AU2017_name': suburb_name,
                     'name': suburb_name_2023,
+                    'slug': generate_suburb_slug(suburb_name_2023),
                     'region': region,
                     'council': council,
                     'location_type': location_type,
@@ -532,7 +685,9 @@ class CrimeDataTransformer:
                     'report_url': '',
                     'widget_embed_code': '',
                     'summary_text': '',
-                    'tags': []
+                    'tags': [],
+                    'nearby_suburbs': [],
+                    'peak_crime_months': peak_crime_months
                 }
                 
                 # Get and process the geometry data
@@ -569,6 +724,15 @@ class CrimeDataTransformer:
             logger.warning("No crime data available to process")
             return
         
+        # Calculate the latest date from the entire dataset
+        self.df_crimes['Date'] = pd.to_datetime(self.df_crimes['victimisation_date'])
+        latest_date = self.df_crimes['Date'].max()
+        
+        # Get the last day of the latest month
+        latest_month_end = latest_date.replace(day=1) + pd.DateOffset(months=1) - pd.DateOffset(days=1)
+        logger.info(f"Latest date in dataset: {latest_date.strftime('%Y-%m-%d')}")
+        logger.info(f"Using end of latest month as reference: {latest_month_end.strftime('%Y-%m-%d')}")
+        
         # Group by suburb_id to prepare suburb data
         suburb_groups = self.df_crimes.groupby('suburb_id')
         logger.info(f"Found {len(suburb_groups)} unique suburbs to process")
@@ -588,8 +752,9 @@ class CrimeDataTransformer:
             # Create a dictionary with the suburb data
             suburb_input = {
                 'AU2017_name': area_unit,
-                'suburb_id': suburb_id,
-                'suburb_df': suburb_df
+                'suburb_id': str(suburb_id),
+                'suburb_df': suburb_df,
+                'reference_date': latest_month_end  # Pass the reference date
             }
             suburb_inputs.append(suburb_input)
         
@@ -619,6 +784,23 @@ class CrimeDataTransformer:
         self.df_suburbs = pd.DataFrame(processed_suburbs)
         
         if not self.df_suburbs.empty:
+            # Validate suburb records
+            logger.info("Validating suburb records...")
+            suburbs_dict_list = self.df_suburbs.to_dict('records')
+            valid_suburbs, invalid_suburbs = validate_suburb_records(suburbs_dict_list)
+            
+            if invalid_suburbs:
+                logger.warning(f"Found {len(invalid_suburbs)} invalid suburb records")
+                # Save invalid records for debugging
+                invalid_suburbs_file = os.path.join(self.output_dir, 'invalid_suburb_records.json')
+                with open(invalid_suburbs_file, 'w') as f:
+                    json.dump(invalid_suburbs, f, indent=2, default=str)
+                logger.info(f"Invalid suburb records saved to {invalid_suburbs_file}")
+            
+            # Update DataFrame with only valid records
+            self.df_suburbs = pd.DataFrame(valid_suburbs)
+            logger.info(f"Retained {len(self.df_suburbs)} valid suburb records after validation")
+            
             self.df_suburbs['rank_in_region'] = self.df_suburbs.groupby('region')['crime_rate_per_1000'].rank(
                 ascending=False, method='dense'
             ).astype(int)
@@ -731,7 +913,7 @@ class CrimeDataTransformer:
                 # Create a record for this meshblock
                 meshblock_record = {
                     'id': mb_code,
-                    'suburb_id': suburb_id,
+                    'suburb_id': str(suburb_id),
                     'crime_count': count,
                     'lat': 0,
                     'lng': 0,
@@ -769,6 +951,23 @@ class CrimeDataTransformer:
         # Create final meshblocks DataFrame
         self.df_meshblocks = pd.DataFrame(processed_meshblocks)
         self.df_meshblocks = self.df_meshblocks.replace([np.inf, -np.inf, np.nan], None)
+
+        # Validate meshblock records
+        logger.info("Validating meshblock records...")
+        meshblocks_dict_list = self.df_meshblocks.to_dict('records')
+        valid_meshblocks, invalid_meshblocks = validate_meshblock_records(meshblocks_dict_list)
+        
+        if invalid_meshblocks:
+            logger.warning(f"Found {len(invalid_meshblocks)} invalid meshblock records")
+            # Save invalid records for debugging
+            invalid_meshblocks_file = os.path.join(self.output_dir, 'invalid_meshblock_records.json')
+            with open(invalid_meshblocks_file, 'w') as f:
+                json.dump(invalid_meshblocks, f, indent=2, default=str)
+            logger.info(f"Invalid meshblock records saved to {invalid_meshblocks_file}")
+        
+        # Update DataFrame with only valid records
+        self.df_meshblocks = pd.DataFrame(valid_meshblocks)
+        logger.info(f"Retained {len(self.df_meshblocks)} valid meshblock records after validation")
 
         logger.info(f"Processed {len(self.df_meshblocks)} meshblocks with crime data and geometries")
 
@@ -1016,13 +1215,54 @@ class CrimeDataTransformer:
         logger.info(f"Average crime rate per 1,000 people: {self.df_suburbs['crime_rate_per_1000'].mean():.2f}")
         logger.info("-" * 50)
 
-def process_large_dataset(input_file: str) -> None:
+    def calculate_and_store_nearby_suburbs(self, radius_km: float = 10.0, max_nearby: int = 10, 
+                                         batch_size: int = 50) -> None:
+        """
+        Calculate and store nearby suburbs for all suburbs in the DataFrame
+        """
+        if not self.supabase:
+            logger.error("Supabase client not initialized")
+            return
+            
+        if self.df_suburbs is None or self.df_suburbs.empty:
+            logger.warning("No suburbs data available for nearby suburbs calculation")
+            return
+
+        logger.info("🚀 Starting nearby suburbs calculation...")
+        
+        # Convert DataFrame to list of dictionaries for processing
+        all_suburbs = self.df_suburbs.to_dict('records')
+        logger.info(f"✅ Found {len(all_suburbs)} suburbs")
+        
+        # Step 1: Calculate nearby suburbs for each suburb
+        logger.info(f"🔄 Calculating nearby suburbs (radius: {radius_km}km, max: {max_nearby})...")
+        
+        updated_suburbs = []
+        
+        # Use tqdm for progress bar
+        for suburb in tqdm(all_suburbs, desc="Processing suburbs"):
+            # Skip suburbs without valid coordinates
+            if not suburb.get('lat') or not suburb.get('lng') or suburb['lat'] == 0 or suburb['lng'] == 0:
+                suburb['nearby_suburbs'] = []
+                updated_suburbs.append(suburb)
+                continue
+                
+            nearby_suburbs = find_nearby_suburbs(suburb, all_suburbs, radius_km, max_nearby)
+            suburb['nearby_suburbs'] = nearby_suburbs
+            updated_suburbs.append(suburb)
+        
+        # Step 2: Update the DataFrame with nearby suburbs data
+        self.df_suburbs = pd.DataFrame(updated_suburbs)
+        
+        logger.info("✅ Nearby suburbs calculation completed!")
+
+def process_large_dataset(input_file: str, calculate_nearby: bool = True) -> None:
     """
     Process a large dataset in batches to avoid memory issues
     
     Args:
         input_file: Path to the input CSV file
-        batch_size: Number of rows to process in each batch
+        calculate_nearby: Whether to calculate nearby suburbs
     """
     # Create output directory
     output_dir = 'output'
@@ -1047,15 +1287,18 @@ def process_large_dataset(input_file: str) -> None:
     logger.info("Creating suburbs table...")
     transformer._create_suburbs_table()
     
-    # Print crime statistics after creating suburbs table
-    #transformer.print_crime_statistics()
-    
+    # Calculate nearby suburbs after creating suburbs table (if enabled)
+    if calculate_nearby:
+        logger.info("Calculating nearby suburbs...")
+        transformer.calculate_and_store_nearby_suburbs(radius_km=25.0, max_nearby=5)
+
     logger.info("Creating meshblocks table...")
     transformer._create_meshblocks_table()
 
     # Save data to Supabase
     if transformer.supabase:
         transformer.save_to_supabase()
+        
 
     # Save data to CSV
     #transformer.save_to_csv()
@@ -1070,6 +1313,7 @@ def main():
     parser.add_argument('--input', required=True, help='Input CSV file')
     parser.add_argument('--output-dir', default='output', help='Output directory')
     parser.add_argument('--max-workers', type=int, default=None, help='Maximum number of worker threads')
+    parser.add_argument('--no-nearby', action='store_true', help='Skip nearby suburbs calculation')
 
     args = parser.parse_args()
     
@@ -1077,7 +1321,119 @@ def main():
     if args.max_workers:
         multiprocessing.cpu_count = lambda: args.max_workers
     
-    process_large_dataset(args.input)
+    process_large_dataset(args.input, calculate_nearby=not args.no_nearby)
+
+def clean_text(text: str) -> str:
+    """
+    Clean text by removing special characters and normalizing spaces
+    
+    Args:
+        text: Input text to clean
+        
+    Returns:
+        Cleaned text string
+    """
+    if pd.isna(text):
+        return text
+        
+    # Replace special characters with spaces
+    text = str(text)
+    text = text.replace('.', ' ')  # Replace dots with spaces
+    # text = text.replace('-', ' ')  # Replace hyphens with spaces
+    # text = text.replace('_', ' ')  # Replace underscores with spaces
+    
+    # Normalize spaces (replace multiple spaces with single space)
+    text = ' '.join(text.split())
+    
+    return text.strip()
+
+def generate_suburb_slug(suburb_name: str) -> str:
+    """
+    Generate a URL-friendly slug from suburb name
+    Examples:
+    - "Parnell East" -> "parnell-east"
+    - "Opua (Far North District)" -> "opua-far-north-district"
+    """
+    if not suburb_name:
+        return ""
+    
+    # Convert to lowercase
+    slug = suburb_name.lower()
+    
+    # Replace parentheses and their contents with spaces, but keep the content
+    slug = re.sub(r'\(([^)]+)\)', r' \1', slug)
+    
+    # Replace any non-alphanumeric characters with spaces
+    slug = re.sub(r'[^a-z0-9\s]', ' ', slug)
+    
+    # Replace multiple spaces with single space and strip
+    slug = ' '.join(slug.split())
+    
+    # Replace spaces with hyphens
+    slug = slug.replace(' ', '-')
+    
+    # Remove any leading/trailing hyphens
+    slug = slug.strip('-')
+    
+    return slug
+
+def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """
+    Calculate the great circle distance between two points 
+    on the earth (specified in decimal degrees) using Haversine formula
+    Returns distance in kilometers
+    """
+    # Convert decimal degrees to radians
+    lat1, lng1, lat2, lng2 = map(math.radians, [lat1, lng1, lat2, lng2])
+    
+    # Haversine formula
+    dlat = lat2 - lat1
+    dlng = lng2 - lng1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlng/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    
+    # Radius of earth in kilometers
+    r = 6371
+    
+    return c * r
+
+def find_nearby_suburbs(target_suburb: Dict[str, Any], all_suburbs: List[Dict[str, Any]], 
+                       radius_km: float = 10.0, max_nearby: int = 10) -> List[str]:
+    """
+    Find nearby suburbs for a target suburb
+    Returns a list of suburb slugs sorted by distance
+    """
+    nearby_suburbs_with_distance = []
+    target_lat = target_suburb['lat']
+    target_lng = target_suburb['lng']
+    target_id = target_suburb['suburb_id']
+    
+    for other_suburb in all_suburbs:
+        if other_suburb['suburb_id'] == target_id:
+            continue
+            
+        # Skip suburbs without valid coordinates or slug
+        if not other_suburb.get('lat') or not other_suburb.get('lng') or other_suburb['lat'] == 0 or other_suburb['lng'] == 0:
+            continue
+        if not other_suburb.get('slug'):
+            continue
+            
+        distance_km = calculate_distance(
+            target_lat, target_lng,
+            other_suburb['lat'], other_suburb['lng']
+        )
+        
+        if distance_km <= radius_km:
+            nearby_suburbs_with_distance.append({
+                'slug': other_suburb['slug'],
+                'distance_km': distance_km
+            })
+    
+    # Sort by distance and extract only the slugs
+    nearby_suburbs_with_distance.sort(key=lambda x: x['distance_km'])
+    nearby_suburb_slugs = [suburb['slug'] for suburb in nearby_suburbs_with_distance[:max_nearby]]
+    
+    return nearby_suburb_slugs
 
 if __name__ == "__main__":
     main()

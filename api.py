@@ -47,7 +47,7 @@ redis_client = redis.Redis.from_url(os.getenv('REDIS_URL'))
 
 # Initialize Supabase client
 supabase_url = os.getenv("SUPABASE_URL")
-supabase_key = os.getenv("SUPABASE_KEY")
+supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 if not supabase_url or not supabase_key:
     raise ValueError("Supabase credentials not found in environment variables")
 supabase: Client = create_client(supabase_url, supabase_key)
@@ -55,6 +55,7 @@ supabase: Client = create_client(supabase_url, supabase_key)
 # Pydantic models for request/response validation
 class SuburbSummary(BaseModel):
     suburb_id: str
+    slug: str
     name: str
     region: str
     council: str
@@ -64,27 +65,19 @@ class SuburbSummary(BaseModel):
     crime_rate_per_1000: float
     crime_trend: str
     total_crimes_12m: int
-    rank_in_region: Optional[int] = None
-    crime_breakdown: Optional[Dict[str, int]] = None
-    trend_3m_change: Optional[float] = None
-    report_url: str
-    widget_embed_code: Optional[str] = None
-    summary_text: Optional[str] = None
-    tags: Optional[List[str]] = None
-    geometry: Optional[Dict[str, Any]] = None
-    location_type: Optional[str] = None
-    meshblocks: Optional[List[str]] = None
-    AU2017_name: Optional[str] = None
+    #report_url: str
+    geometry: Dict[str, Any]
 
 class SuburbDetail(SuburbSummary):
     rank_in_region: int
-    geometry: Optional[Dict[str, Any]] = None
     crime_breakdown: Dict[str, int]
     trend_3m_change: float
+    nearby_suburbs: List[str]
+    peak_crime_months: List[date]
     #crimes: List[Dict[str, Any]]
     #downloadable_report_url: str
-    widget_embed_code: str
-    tags: List[str]
+    #widget_embed_code: str
+    #tags: List[str]
 
 class CrimeEvent(BaseModel):
     event_id: str
@@ -194,7 +187,9 @@ async def get_suburbs(
     page_size: int = Query(50, ge=1, le=500, description="Number of records per page")
 ):
     """Get a list of suburbs with summary crime data"""
-    query = supabase.table("suburbs").select("*")
+    # Select only fields needed for SuburbSummary model
+    select_fields = "suburb_id,slug,name,region,council,lat,lng,safety_score,crime_rate_per_1000,crime_trend,total_crimes_12m,report_url,geometry"
+    query = supabase.table("suburbs").select(select_fields)
     
     # Apply all filters from query parameters
     for field, value in params.items():
@@ -216,18 +211,40 @@ async def get_suburbs(
 @app.get("/api/suburbs/{suburb_id}", response_model=SuburbDetail)
 @cache_response(prefix="suburb_detail", ttl_seconds=86400)  # Cache for 1 day
 async def get_suburb_detail(
-    suburb_id: str = Path(..., description="The ID of the suburb"),
-    page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(100, ge=1, le=1000, description="Number of records per page")
+    suburb_id: str = Path(..., description="The ID of the suburb")
 ):
     """Get detailed information about a specific suburb"""
-    # Get suburb data
-    suburb_response = supabase.table("suburbs").select("*").eq("suburb_id", suburb_id).execute()
+    # Select only fields needed for SuburbDetail model (includes all SuburbSummary fields plus additional ones)
+    select_fields = "suburb_id,slug,name,region,council,lat,lng,safety_score,crime_rate_per_1000,crime_trend,total_crimes_12m,report_url,rank_in_region,crime_breakdown,trend_3m_change,nearby_suburbs,peak_crime_months,geometry"
+    
+    suburb_response = supabase.table("suburbs").select(select_fields).eq("suburb_id", suburb_id).execute()
     
     if not suburb_response.data:
         raise HTTPException(status_code=404, detail="Suburb not found")
     
     return suburb_response.data[0]
+
+def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """
+    Calculate the great circle distance between two points 
+    on the earth (specified in decimal degrees) using Haversine formula
+    Returns distance in kilometers
+    """
+    import math
+    
+    # Convert decimal degrees to radians
+    lat1, lng1, lat2, lng2 = map(math.radians, [lat1, lng1, lat2, lng2])
+    
+    # Haversine formula
+    dlat = lat2 - lat1
+    dlng = lng2 - lng1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlng/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    
+    # Radius of earth in kilometers
+    r = 6371
+    
+    return c * r
 
 def get_crime_query_params(
     offence_category: Optional[str] = Query(None, description="Filter by crime type"),
@@ -245,7 +262,11 @@ def get_crime_query_params(
 
 @app.get("/api/crimes", response_model=List[CrimeEvent])
 @cache_response(prefix="crimes_list", ttl_seconds=86400)  # Cache for 1 day
-async def get_crimes(params: Dict[str, Any] = Depends(get_crime_query_params)):
+async def get_crimes(
+    params: Dict[str, Any] = Depends(get_crime_query_params),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(100, ge=1, le=1000, description="Number of records per page")
+):
     """Get crime events with optional filtering"""
     query = supabase.table("crimes").select("*")
     
@@ -259,6 +280,9 @@ async def get_crimes(params: Dict[str, Any] = Depends(get_crime_query_params)):
             query = query.lte("victimisation_date", value)
         else:
             query = query.eq(field, value)
+    
+    # Apply pagination
+    query = query.range((page - 1) * page_size, page * page_size - 1)
     
     response = query.execute()
     return response.data
