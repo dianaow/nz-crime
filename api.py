@@ -72,7 +72,8 @@ class SuburbDetail(SuburbSummary):
     rank_in_region: int
     crime_breakdown: Dict[str, int]
     trend_3m_change: float
-    nearby_suburbs: List[str]
+    population: int
+    nearby_suburbs: List[Dict[str, Any]]
     peak_crime_months: List[date]
     #crimes: List[Dict[str, Any]]
     #downloadable_report_url: str
@@ -215,7 +216,7 @@ async def get_suburb_detail(
 ):
     """Get detailed information about a specific suburb"""
     # Select only fields needed for SuburbDetail model (includes all SuburbSummary fields plus additional ones)
-    select_fields = "suburb_id,slug,name,region,council,lat,lng,safety_score,crime_rate_per_1000,crime_trend,total_crimes_12m,report_url,rank_in_region,crime_breakdown,trend_3m_change,nearby_suburbs,peak_crime_months,geometry"
+    select_fields = "suburb_id,slug,name,region,council,lat,lng,safety_score,crime_rate_per_1000,crime_trend,total_crimes_12m,report_url,rank_in_region,crime_breakdown,trend_3m_change,population,nearby_suburbs,peak_crime_months,geometry"
     
     suburb_response = supabase.table("suburbs").select(select_fields).eq("suburb_id", suburb_id).execute()
     

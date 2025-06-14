@@ -44,7 +44,7 @@ class CrimeRecordSchema(BaseModel):
     """Schema for validating individual crime records"""
     event_id: str = Field(..., min_length=1, description="Unique event identifier")
     suburb_id: str = Field(..., min_length=1, description="Suburb identifier")
-    victimisation_date: str = Field(..., pattern=r'^\d{4}-\d{2}-\d{2}$', description="Date in YYYY-MM-DD format")
+    victimisation_date: datetime = Field(..., description="Date in YYYY-MM-DD format")
     offence_code: Optional[str] = Field(None, max_length=10, description="Offence code")
     offence_category: Optional[str] = Field(None, max_length=200, description="Offence category")
     offence_description: Optional[str] = Field(None, max_length=500, description="Offence description")
@@ -75,7 +75,8 @@ class SuburbRecordSchema(BaseModel):
     widget_embed_code: str = Field('', description="Widget embed code")
     summary_text: str = Field('', description="Summary text")
     tags: List[str] = Field(default_factory=list, description="Tags")
-    nearby_suburbs: List[dict] = Field(default_factory=list, description="Nearby suburbs data")
+    population: int = Field(0, ge=0, description="Population count")
+    nearby_suburbs: List[Dict[str, Any]] = Field(default_factory=list, description="Nearby suburbs data with slug, name, and region")
 
 class MeshblockRecordSchema(BaseModel):
     """Schema for validating meshblock records"""
@@ -183,12 +184,8 @@ def calculate_peak_crime_months(suburb_df: pd.DataFrame, top_n: int = 3) -> List
         return []
     
     try:
-        # Ensure Date column exists and is datetime
-        if 'Date' not in suburb_df.columns:
-            suburb_df['Date'] = pd.to_datetime(suburb_df['victimisation_date'])
-        
         # Group by year-month and count crimes
-        suburb_df['YearMonth'] = suburb_df['Date'].dt.to_period('M')
+        suburb_df['YearMonth'] = suburb_df['victimisation_date'].dt.to_period('M')
         monthly_crimes = suburb_df.groupby('YearMonth').size()
         
         # Get the top N months with highest crime counts
@@ -456,8 +453,8 @@ class CrimeDataTransformer:
             anzsoc_reverse_lookup = {v.lower(): k for k, v in anzsoc_divisions.items()}
             
             # Process dates in bulk
-            chunk['victimisation_date'] = pd.to_datetime(chunk['Year Month'], format='%B %Y', errors='coerce').dt.strftime('%Y-%m-%d')
-            
+            chunk['victimisation_date'] = pd.to_datetime(chunk['Year Month'], format='%B %Y', errors='coerce')
+
             # Extract offence codes in bulk
             chunk['offence_code'] = chunk['ANZSOC Division'].apply(
                 lambda x: x[:2] if pd.notna(x) and len(str(x)) >= 2 and str(x)[:2].isdigit() 
@@ -613,15 +610,13 @@ class CrimeDataTransformer:
             suburb_df = item['suburb_df']
             
             try:
-                # Calculate crime statistics using victimisation_date
-                suburb_df['Date'] = pd.to_datetime(suburb_df['victimisation_date'])
                 current_date = item['reference_date']
                 one_year_ago = current_date - timedelta(days=365)
-                last_12m_data = suburb_df[suburb_df['Date'] >= one_year_ago]
+                last_12m_data = suburb_df[suburb_df['victimisation_date'] >= one_year_ago]
                 total_crimes_12m = len(last_12m_data)
 
                 # Calculate crime trend
-                suburb_df['YearMonth'] = suburb_df['Date'].dt.to_period('M')
+                suburb_df['YearMonth'] = suburb_df['victimisation_date'].dt.to_period('M')
                 monthly_crimes = suburb_df.groupby('YearMonth').size()
                 
                 if len(monthly_crimes) >= 2:
@@ -686,6 +681,7 @@ class CrimeDataTransformer:
                     'widget_embed_code': '',
                     'summary_text': '',
                     'tags': [],
+                    'population': population,
                     'nearby_suburbs': [],
                     'peak_crime_months': peak_crime_months
                 }
@@ -725,8 +721,7 @@ class CrimeDataTransformer:
             return
         
         # Calculate the latest date from the entire dataset
-        self.df_crimes['Date'] = pd.to_datetime(self.df_crimes['victimisation_date'])
-        latest_date = self.df_crimes['Date'].max()
+        latest_date = self.df_crimes['victimisation_date'].max()
         
         # Get the last day of the latest month
         latest_month_end = latest_date.replace(day=1) + pd.DateOffset(months=1) - pd.DateOffset(days=1)
@@ -971,6 +966,25 @@ class CrimeDataTransformer:
 
         logger.info(f"Processed {len(self.df_meshblocks)} meshblocks with crime data and geometries")
 
+    def _prepare_data_for_json_serialization(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Prepare DataFrame for JSON serialization by converting datetime objects to ISO format strings
+        
+        Args:
+            df: DataFrame to prepare
+            
+        Returns:
+            DataFrame with datetime columns converted to strings
+        """
+        df_copy = df.copy()
+        
+        # Convert datetime columns to ISO format strings
+        for col in df_copy.columns:
+            if df_copy[col].dtype == 'datetime64[ns]' or pd.api.types.is_datetime64_any_dtype(df_copy[col]):
+                df_copy[col] = df_copy[col].dt.strftime('%Y-%m-%d')
+        
+        return df_copy
+
     def _save_batch_to_supabase(self, batch_data: List[Dict], table_name: str, use_upsert: bool) -> int:
         """
         Process and save a batch of data to Supabase
@@ -1057,8 +1071,11 @@ class CrimeDataTransformer:
 
         logger.info(f"Importing {len(df)} records to {table_name} using parallel processing...")
         
+        # Prepare data for JSON serialization
+        df_prepared = self._prepare_data_for_json_serialization(df)
+        
         # Convert DataFrame to list of dictionaries
-        data_records = df.to_dict(orient='records')
+        data_records = df_prepared.to_dict(orient='records')
         total_records = len(data_records)
         
         # Create batches for parallel processing
@@ -1290,7 +1307,7 @@ def process_large_dataset(input_file: str, calculate_nearby: bool = True) -> Non
     # Calculate nearby suburbs after creating suburbs table (if enabled)
     if calculate_nearby:
         logger.info("Calculating nearby suburbs...")
-        transformer.calculate_and_store_nearby_suburbs(radius_km=25.0, max_nearby=5)
+        transformer.calculate_and_store_nearby_suburbs(radius_km=25.0, max_nearby=3)
 
     logger.info("Creating meshblocks table...")
     transformer._create_meshblocks_table()
@@ -1398,10 +1415,10 @@ def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> fl
     return c * r
 
 def find_nearby_suburbs(target_suburb: Dict[str, Any], all_suburbs: List[Dict[str, Any]], 
-                       radius_km: float = 10.0, max_nearby: int = 10) -> List[str]:
+                       radius_km: float = 10.0, max_nearby: int = 10) -> List[Dict[str, Any]]:
     """
     Find nearby suburbs for a target suburb
-    Returns a list of suburb slugs sorted by distance
+    Returns a list of suburb objects
     """
     nearby_suburbs_with_distance = []
     target_lat = target_suburb['lat']
@@ -1425,15 +1442,16 @@ def find_nearby_suburbs(target_suburb: Dict[str, Any], all_suburbs: List[Dict[st
         
         if distance_km <= radius_km:
             nearby_suburbs_with_distance.append({
+                'suburb_id': other_suburb['suburb_id'],
                 'slug': other_suburb['slug'],
-                'distance_km': distance_km
+                'name': other_suburb['name'],
+                'region': other_suburb.get('region', ''),
+                'distance_km': round(distance_km, 2)
             })
     
-    # Sort by distance and extract only the slugs
+    # Sort by distance and limit results
     nearby_suburbs_with_distance.sort(key=lambda x: x['distance_km'])
-    nearby_suburb_slugs = [suburb['slug'] for suburb in nearby_suburbs_with_distance[:max_nearby]]
-    
-    return nearby_suburb_slugs
+    return nearby_suburbs_with_distance[:max_nearby]
 
 if __name__ == "__main__":
     main()
